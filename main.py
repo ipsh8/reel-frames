@@ -135,6 +135,35 @@ def frames(req: FrameRequest):
         raise HTTPException(500, str(e)[:300])
 
 
+@app.post("/audio", dependencies=[Depends(check_api_key)])
+def audio(req: VideoRequest):
+    """Extract the audio track as an mp3 file."""
+    workdir = tempfile.mkdtemp(prefix="au_")
+    try:
+        direct = resolve_url(req.video_url)
+        out_path = os.path.join(workdir, "audio.mp3")
+        cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error",
+               "-i", direct, "-vn", "-ac", "1", "-b:a", "64k", out_path]
+        try:
+            out = subprocess.run(cmd, capture_output=True, text=True, timeout=FFMPEG_TIMEOUT)
+        except subprocess.TimeoutExpired:
+            raise HTTPException(504, "Audio extraction timed out")
+        if out.returncode != 0 or not os.path.exists(out_path) or os.path.getsize(out_path) < 1024:
+            raise HTTPException(422, f"No audio track found or extraction failed: {out.stderr.strip()[:300]}")
+
+        final = os.path.join(tempfile.gettempdir(), f"audio_{uuid.uuid4().hex}.mp3")
+        shutil.move(out_path, final)
+        shutil.rmtree(workdir, ignore_errors=True)
+        return FileResponse(final, media_type="audio/mpeg", filename="audio.mp3",
+                            background=BackgroundTask(lambda: os.remove(final)))
+    except HTTPException:
+        shutil.rmtree(workdir, ignore_errors=True)
+        raise
+    except Exception as e:
+        shutil.rmtree(workdir, ignore_errors=True)
+        raise HTTPException(500, str(e)[:300])
+
+
 @app.post("/download", dependencies=[Depends(check_api_key)])
 def download(req: VideoRequest):
     workdir = tempfile.mkdtemp(prefix="dl_")
