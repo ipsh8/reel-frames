@@ -24,8 +24,11 @@ from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, Field
 from starlette.background import BackgroundTask
+from mask_service import router as mask_router
 
 app = FastAPI(title="Reel Toolkit", version="3.0.0")
+
+app.include_router(mask_router)  
 
 FFMPEG_TIMEOUT = int(os.getenv("FFMPEG_TIMEOUT", "180"))
 YTDLP_TIMEOUT = int(os.getenv("YTDLP_TIMEOUT", "60"))
