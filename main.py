@@ -29,7 +29,8 @@ from audio_service import router as audio_router
 
 app = FastAPI(title="Reel Toolkit", version="3.0.0")
 
-app.include_router(mask_router)  
+app.include_router(mask_router)
+app.include_router(audio_router)
 
 FFMPEG_TIMEOUT = int(os.getenv("FFMPEG_TIMEOUT", "180"))
 YTDLP_TIMEOUT = int(os.getenv("YTDLP_TIMEOUT", "60"))
