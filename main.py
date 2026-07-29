@@ -3,18 +3,6 @@ Reel Toolkit v3.1 — pure media extraction. No AI, no transcription, no analysi
 
 Endpoints (POST, require X-API-Key header):
   /frames    -> screenshots at intervals (JSON base64 or zip)
-
-  def probe_streams(path_or_url: str) -> list[str]:
-    """List the stream types (video/audio) ffprobe can see in the media."""
-    try:
-        out = subprocess.run(
-            ["ffprobe", "-v", "error", "-show_entries", "stream=codec_type",
-             "-of", "csv=p=0", path_or_url],
-            capture_output=True, text=True, timeout=30)
-        return [s.strip() for s in out.stdout.splitlines() if s.strip()]
-    except Exception:
-        return []
-        
   /audio     -> the reel's audio track as an .mp3 file
   /download  -> the reel video itself as an .mp4 file
   /health    -> liveness check (GET, no auth)
@@ -209,13 +197,6 @@ def audio(req: VideoRequest):
     try:
         # download + merge, so split-stream reels still yield sound
         direct = fetch_media(req.video_url, workdir)
-        streams = probe_streams(direct)
-        if "audio" not in streams:
-            raise HTTPException(
-                422,
-                f"REEL_HAS_NO_AUDIO — streams found: {streams or 'none'}. "
-                "Instagram likely muted this reel (unlicensed music) or it was posted silent."
-            )
         out_path = os.path.join(workdir, "audio.mp3")
         cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error",
                "-i", direct, "-vn", "-ac", "1", "-b:a", "64k", out_path]
