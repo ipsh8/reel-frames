@@ -59,11 +59,11 @@ class VideoRequest(BaseModel):
     video_url: str
 
 
-def resolve_url(url: str) -> str:
+def resolve_url(url: str, fmt: str = "best[ext=mp4]/best") -> str:
     """If it's an Instagram page URL, resolve to direct media URL via yt-dlp."""
     if "instagram.com" not in url:
         return url
-    cmd = ["yt-dlp", "-g", "-f", "best[ext=mp4]/best", "--no-warnings", url]
+    cmd = ["yt-dlp", "-g", "-f", fmt, "--no-warnings", url]
     cookies = os.getenv("IG_COOKIES_FILE")
     if cookies and os.path.exists(cookies):
         cmd[1:1] = ["--cookies", cookies]
@@ -103,7 +103,11 @@ def health():
 def frames(req: FrameRequest):
     workdir = tempfile.mkdtemp(prefix="frames_")
     try:
-        direct = resolve_url(req.video_url)
+        # ask yt-dlp for the AUDIO stream; fall back to the video stream if there isn't one
+        try:
+            direct = resolve_url(req.video_url, "bestaudio/best")
+        except HTTPException:
+            direct = resolve_url(req.video_url)
         paths = extract_frames_from(direct, req, workdir)
         timestamps = [round(req.start + i * req.interval, 3) for i in range(len(paths))]
 
