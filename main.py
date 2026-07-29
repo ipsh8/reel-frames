@@ -1,10 +1,16 @@
 """
-Reel Toolkit v3 — pure media extraction. No AI, no transcription, no analysis.
+Reel Toolkit v3.1 — pure media extraction. No AI, no transcription, no analysis.
 
 Endpoints (POST, require X-API-Key header):
   /frames    -> screenshots at intervals (JSON base64 or zip)
+  /audio     -> the reel's audio track as an .mp3 file
   /download  -> the reel video itself as an .mp4 file
   /health    -> liveness check (GET, no auth)
+
+v3.1 change: /audio and /download now DOWNLOAD and MERGE the media instead of
+resolving a single stream URL. Instagram serves some reels as separate video and
+audio streams; grabbing one stream URL gave a soundless file. /frames still uses
+the fast URL path because frames never need audio.
 
 Env vars:
   API_KEY          required — clients must send it as X-API-Key
@@ -27,13 +33,14 @@ from starlette.background import BackgroundTask
 from mask_service import router as mask_router
 from audio_service import router as audio_router
 
-app = FastAPI(title="Reel Toolkit", version="3.0.0")
+app = FastAPI(title="Reel Toolkit", version="3.1.0")
 
 app.include_router(mask_router)
 app.include_router(audio_router)
 
 FFMPEG_TIMEOUT = int(os.getenv("FFMPEG_TIMEOUT", "180"))
 YTDLP_TIMEOUT = int(os.getenv("YTDLP_TIMEOUT", "60"))
+YTDLP_DOWNLOAD_TIMEOUT = int(os.getenv("YTDLP_DOWNLOAD_TIMEOUT", str(YTDLP_TIMEOUT * 4)))
 HARD_MAX_FRAMES = int(os.getenv("HARD_MAX_FRAMES", "300"))
 
 
@@ -59,14 +66,23 @@ class VideoRequest(BaseModel):
     video_url: str
 
 
-def resolve_url(url: str, fmt: str = "best[ext=mp4]/best") -> str:
-    """If it's an Instagram page URL, resolve to direct media URL via yt-dlp."""
-    if "instagram.com" not in url:
-        return url
-    cmd = ["yt-dlp", "-g", "-f", fmt, "--no-warnings", url]
+def _ytdlp_cookies(cmd: list) -> list:
+    """Insert --cookies right after the yt-dlp binary, if a cookie file is configured."""
     cookies = os.getenv("IG_COOKIES_FILE")
     if cookies and os.path.exists(cookies):
         cmd[1:1] = ["--cookies", cookies]
+    return cmd
+
+
+def resolve_url(url: str, fmt: str = "best[ext=mp4]/best") -> str:
+    """Resolve an Instagram page URL to ONE direct stream URL. Fast, no download.
+
+    NOTE: this cannot merge separate video/audio streams. Use it only where audio
+    does not matter (i.e. /frames). For anything needing sound, use fetch_media().
+    """
+    if "instagram.com" not in url:
+        return url
+    cmd = _ytdlp_cookies(["yt-dlp", "-g", "-f", fmt, "--no-warnings", url])
     try:
         out = subprocess.run(cmd, capture_output=True, text=True, timeout=YTDLP_TIMEOUT)
     except subprocess.TimeoutExpired:
@@ -74,6 +90,39 @@ def resolve_url(url: str, fmt: str = "best[ext=mp4]/best") -> str:
     if out.returncode != 0 or not out.stdout.strip():
         raise HTTPException(422, f"Could not resolve Instagram URL: {out.stderr.strip()[:300]}")
     return out.stdout.strip().splitlines()[0]
+
+
+def fetch_media(url: str, workdir: str) -> str:
+    """Download the media to disk, MERGING separate video and audio streams.
+
+    Returns a local file path (or the original URL if it is not an Instagram page).
+    Both ffmpeg call sites accept either, since ffmpeg's -i takes paths and URLs.
+    """
+    if "instagram.com" not in url:
+        return url
+
+    out_tmpl = os.path.join(workdir, "src.%(ext)s")
+    cmd = _ytdlp_cookies([
+        "yt-dlp",
+        "-f", "bestvideo*+bestaudio/best",
+        "--merge-output-format", "mp4",
+        "-o", out_tmpl,
+        "--no-warnings",
+        url,
+    ])
+    try:
+        out = subprocess.run(cmd, capture_output=True, text=True, timeout=YTDLP_DOWNLOAD_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        raise HTTPException(504, "yt-dlp timed out downloading media")
+
+    files = [f for f in os.listdir(workdir) if f.startswith("src.")]
+    if out.returncode != 0 or not files:
+        raise HTTPException(422, f"Could not download media: {out.stderr.strip()[:300]}")
+
+    # prefer the merged container; fall back to the first file deterministically
+    merged = [f for f in files if f == "src.mp4"]
+    chosen = (merged or sorted(files))[0]
+    return os.path.join(workdir, chosen)
 
 
 def extract_frames_from(source: str, req: FrameRequest, workdir: str) -> list[str]:
@@ -96,18 +145,15 @@ def extract_frames_from(source: str, req: FrameRequest, workdir: str) -> list[st
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "version": "3.0.0"}
+    return {"status": "ok", "version": "3.1.0"}
 
 
 @app.post("/frames", dependencies=[Depends(check_api_key)])
 def frames(req: FrameRequest):
     workdir = tempfile.mkdtemp(prefix="frames_")
     try:
-        # ask yt-dlp for the AUDIO stream; fall back to the video stream if there isn't one
-        try:
-            direct = resolve_url(req.video_url, "bestaudio/best")
-        except HTTPException:
-            direct = resolve_url(req.video_url)
+        # frames need VIDEO only — keep the fast URL path, no download, no merge
+        direct = resolve_url(req.video_url)
         paths = extract_frames_from(direct, req, workdir)
         timestamps = [round(req.start + i * req.interval, 3) for i in range(len(paths))]
 
@@ -149,7 +195,8 @@ def audio(req: VideoRequest):
     """Extract the audio track as an mp3 file."""
     workdir = tempfile.mkdtemp(prefix="au_")
     try:
-        direct = resolve_url(req.video_url)
+        # download + merge, so split-stream reels still yield sound
+        direct = fetch_media(req.video_url, workdir)
         out_path = os.path.join(workdir, "audio.mp3")
         cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error",
                "-i", direct, "-vn", "-ac", "1", "-b:a", "64k", out_path]
@@ -177,7 +224,8 @@ def audio(req: VideoRequest):
 def download(req: VideoRequest):
     workdir = tempfile.mkdtemp(prefix="dl_")
     try:
-        direct = resolve_url(req.video_url)
+        # download + merge, so the saved mp4 actually carries its audio track
+        direct = fetch_media(req.video_url, workdir)
         out_path = os.path.join(workdir, "video.mp4")
         cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error",
                "-i", direct, "-c", "copy", "-movflags", "+faststart", out_path]
