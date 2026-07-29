@@ -16,7 +16,7 @@ Env vars:
   API_KEY          required — clients must send it as X-API-Key
   IG_COOKIES_FILE  optional cookies.txt for gated Instagram content
 """
-
+import yt_dlp
 import base64
 import os
 import shutil
@@ -92,38 +92,56 @@ def resolve_url(url: str, fmt: str = "best[ext=mp4]/best") -> str:
     return out.stdout.strip().splitlines()[0]
 
 
-def fetch_media(url: str, workdir: str) -> str:
-    """Download the media to disk, MERGING separate video and audio streams.
+import os
+import yt_dlp
+from fastapi import HTTPException
 
-    Returns a local file path (or the original URL if it is not an Instagram page).
-    Both ffmpeg call sites accept either, since ffmpeg's -i takes paths and URLs.
+def fetch_media(url: str, workdir: str) -> str:
+    """
+    Downloads media natively using yt-dlp.
+    Engineered to guarantee audio presence and handle dynamic extensions safely.
     """
     if "instagram.com" not in url:
         return url
 
-    out_tmpl = os.path.join(workdir, "src.%(ext)s")
-    cmd = _ytdlp_cookies([
-        "yt-dlp",
-        "-f", "bestvideo*+bestaudio/best",
-        "--merge-output-format", "mp4",
-        "-o", out_tmpl,
-        "--no-warnings",
-        url,
-    ])
+    # We let yt-dlp determine the final extension based on the actual stream container
+    out_tmpl = os.path.join(workdir, "media.%(ext)s")
+    
+    ydl_opts = {
+        # THE MAGIC BULLET: 'b/bv+ba'
+        # Instead of prioritizing separate streams (which break on IG), we prioritize 'b'.
+        # 'b' grabs the legacy pre-muxed MP4 file that GUARANTEES both video and audio 
+        # are baked into a single file. It only falls back to merging if 'b' is missing.
+        'format': 'b/bv+ba',
+        'outtmpl': out_tmpl,
+        'quiet': True,
+        'no_warnings': True,
+    }
+    
+    cookies = os.getenv("IG_COOKIES_FILE")
+    if cookies and os.path.exists(cookies):
+        ydl_opts['cookiefile'] = cookies
+
     try:
-        out = subprocess.run(cmd, capture_output=True, text=True, timeout=YTDLP_DOWNLOAD_TIMEOUT)
-    except subprocess.TimeoutExpired:
-        raise HTTPException(504, "yt-dlp timed out downloading media")
+        # Execute download natively (no subprocess blocking or shell text parsing)
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            ydl.download([url])
+            
+    except yt_dlp.utils.DownloadError as e:
+        # Cleanly catch actual download failures (e.g., video deleted, rate limited)
+        raise HTTPException(status_code=422, detail=f"Media download failed: {str(e)}")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Server error: {str(e)}")
 
-    files = [f for f in os.listdir(workdir) if f.startswith("src.")]
-    if out.returncode != 0 or not files:
-        raise HTTPException(422, f"Could not download media: {out.stderr.strip()[:300]}")
-
-    # prefer the merged container; fall back to the first file deterministically
-    merged = [f for f in files if f == "src.mp4"]
-    chosen = (merged or sorted(files))[0]
-    return os.path.join(workdir, chosen)
-
+    # THE FOOLPROOF FILE LOCATOR
+    # Because your endpoints create a unique temp 'workdir' for every single request, 
+    # we know the only finished media file sitting in this folder is our successful download.
+    # This prevents extension guessing errors (like expecting .mp4 but getting .webm).
+    for f in os.listdir(workdir):
+        if not f.endswith(".part") and not f.endswith(".ytdl"):
+            return os.path.join(workdir, f)
+            
+    raise HTTPException(status_code=422, detail="yt-dlp finished but no file was found.")
 
 def extract_frames_from(source: str, req: FrameRequest, workdir: str) -> list[str]:
     vf = f"fps=1/{req.interval}"
