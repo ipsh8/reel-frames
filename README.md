@@ -70,10 +70,12 @@ Every `POST` needs the `X-API-Key` header set to the `API_KEY` env var.
   a muted copy of a reel that plays with sound in a browser. The message lists
   the formats the server was offered (`id=audio codec`, where `none` means no
   audio and `?` means unknown), and the same line is in the Railway logs as
-  `[fetch_media]`. If it ends `cookies off`, set `IG_COOKIES` (below): logged
-  out, Instagram withholds the audio stream from Railway for some reels that a
-  home connection gets with sound. `cookies on (IG_COOKIES, but no sessionid…)`
-  means what was pasted isn't a login.
+  `[fetch_media]`. For some reels Instagram sends this server a muted copy
+  (every audio codec `none`) that a phone or home connection gets with sound —
+  logged in or not, in any Railway region. Set `YTDLP_PROXY` (below) so
+  `/audio` and `/download` reach Instagram through a home connection.
+  `cookies on (IG_COOKIES, but no sessionid…)` means what was pasted as
+  `IG_COOKIES` isn't a login.
 - `422 Media download failed: ...`: yt-dlp couldn't fetch the reel. It was
   deleted, it's private, or Instagram rate-limited the server. See
   `IG_COOKIES` below.
@@ -117,6 +119,7 @@ See `.env.example`.
 | `API_KEY` | — | **required**; clients send it as `X-API-Key` |
 | `IG_COOKIES` | — | optional; the `Cookie` header from a logged-in instagram.com request, pasted as one line (`sessionid=…; csrftoken=…`). Logs the server in, so Instagram stops withholding audio. Use a throwaway account |
 | `IG_COOKIES_FILE` | — | optional path to a Netscape `cookies.txt`; used instead of `IG_COOKIES` when both are set |
+| `YTDLP_PROXY` | — | optional; `http://user:pass@host:port`. `/audio` and `/download` reach Instagram through it, so reels Instagram mutes for this server come back with sound. Use a **residential** proxy; `/frames` never uses it |
 | `FFMPEG_TIMEOUT` | 180 | seconds per ffmpeg/ffprobe run |
 | `YTDLP_TIMEOUT` | 60 | seconds for yt-dlp to resolve a URL (`/frames`) |
 | `HARD_MAX_FRAMES` | 300 | server-side cap on `max_frames` |
@@ -135,6 +138,23 @@ See `.env.example`.
 The value is a login. Keep it out of git, chat and logs. When Instagram
 eventually ends the session, errors say `cookies on` but audio disappears again;
 repeat the steps with a fresh copy.
+
+### Getting `YTDLP_PROXY`
+
+Instagram sends a data-centre server muted copies of some reels. A residential
+proxy makes the server's requests arrive from a home connection instead.
+
+1. Sign up with a provider that sells **residential** proxies with Indian IPs
+   (IPRoyal, Decodo/Smartproxy and Bright Data all do). Datacenter proxies won't
+   help — that is the problem being worked around. Billing is per GB; a reel's
+   audio is under 1 MB and a video a few MB.
+2. In their dashboard pick **India** as the location and, if offered, a
+   **sticky** session, so one download keeps one IP.
+3. Copy the address in this form: `http://USERNAME:PASSWORD@HOST:PORT`.
+4. In Railway → this service → **Variables**, add `YTDLP_PROXY` with it.
+
+It contains a password. Errors and logs say only `proxy on` or `proxy off`, and
+strip the address and credentials out of anything yt-dlp reports.
 
 `yt-dlp` is unpinned in `requirements.txt`, so each Railway rebuild picks up
 the latest release. Instagram changes often, so if fetching breaks, redeploying

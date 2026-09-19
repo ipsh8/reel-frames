@@ -1,5 +1,5 @@
 """
-Reel Toolkit v3.2.0 — pure media extraction. No AI, no transcription, no analysis.
+Reel Toolkit v3.3.0 — pure media extraction. No AI, no transcription, no analysis.
 
 Endpoints (POST, require X-API-Key header):
   /frames    -> screenshots at intervals (JSON base64 or zip)
@@ -19,10 +19,15 @@ Env vars:
                    withhold a reel's audio from this server.
   IG_COOKIES_FILE  optional path to a Netscape cookies.txt; used instead of
                    IG_COOKIES when both are set
+  YTDLP_PROXY      optional proxy for /audio and /download
+                   (http://user:pass@host:port). Instagram serves this server
+                   muted copies of some reels; through a residential proxy it
+                   serves the same copy a phone gets, sound included.
 """
 import yt_dlp
 import base64
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -39,7 +44,7 @@ from starlette.background import BackgroundTask
 from mask_service import router as mask_router
 from audio_service import router as audio_router
 
-app = FastAPI(title="Reel Toolkit", version="3.2.0")
+app = FastAPI(title="Reel Toolkit", version="3.3.0")
 
 app.include_router(mask_router)
 app.include_router(audio_router)
@@ -133,6 +138,29 @@ def cookie_file() -> tuple[Optional[str], str]:
                   else "on (IG_COOKIES, but no sessionid, so not logged in)")
 
 
+def ytdlp_proxy() -> Optional[str]:
+    """The proxy /audio and /download send Instagram traffic through, if any.
+
+    Instagram marks some reels `has_audio: false` for this server and sends it a
+    muted file, on every route yt-dlp takes and whether logged in or not, while
+    the same request from a home connection gets the sound. A residential proxy
+    makes the server's requests arrive from a home connection.
+
+    /frames does not use it: frames never need audio, and the proxy is billed
+    by the byte.
+    """
+    return os.getenv("YTDLP_PROXY", "").strip() or None
+
+
+def _redact_proxy(text: str, proxy: Optional[str]) -> str:
+    """Keep the proxy's password out of error messages that reach n8n."""
+    if not proxy:
+        return text
+    text = text.replace(proxy, "<proxy>")
+    creds = re.match(r"^[a-z0-9+.-]+://([^@/]+)@", proxy, re.I)
+    return text.replace(creds.group(1), "<proxy credentials>") if creds else text
+
+
 def _ytdlp_cookies(cmd: list) -> list:
     """Insert --cookies right after the yt-dlp binary, if cookies are configured."""
     path, _ = cookie_file()
@@ -169,7 +197,7 @@ VIDEO_FORMAT = "b/bv*+ba"
 MERGED_VIDEO_FORMAT = "bv*+ba"
 
 
-def describe_formats(info: dict, cookies: str) -> str:
+def describe_formats(info: dict, cookies: str, proxy: bool = False) -> str:
     """Say which formats Instagram offered and which one was picked, for error messages.
 
     Instagram can hand this server a different set of formats than a browser gets,
@@ -178,7 +206,8 @@ def describe_formats(info: dict, cookies: str) -> str:
     offered = ", ".join(f"{f.get('format_id')}={f.get('acodec') or '?'}"
                         for f in info.get("formats") or [])
     return (f"picked {info.get('format_id')}; offered (id=audio codec) {offered or 'none'}; "
-            f"cookies {cookies}; yt-dlp {yt_dlp.version.__version__}")
+            f"cookies {cookies}; proxy {'on' if proxy else 'off'}; "
+            f"yt-dlp {yt_dlp.version.__version__}")
 
 
 def fetch_media(url: str, workdir: str, fmt: str) -> tuple[str, str]:
@@ -203,17 +232,21 @@ def fetch_media(url: str, workdir: str, fmt: str) -> tuple[str, str]:
     cookies, cookie_status = cookie_file()
     if cookies:
         ydl_opts['cookiefile'] = cookies
+    proxy = ytdlp_proxy()
+    if proxy:
+        ydl_opts['proxy'] = proxy
 
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=True)
     except yt_dlp.utils.DownloadError as e:
         # Cleanly catch actual download failures (e.g., video deleted, rate limited)
-        raise HTTPException(status_code=422, detail=f"Media download failed: {str(e)}")
+        raise HTTPException(status_code=422, detail=_redact_proxy(
+            f"Media download failed: {e}", proxy))
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Server error: {str(e)}")
+        raise HTTPException(status_code=500, detail=_redact_proxy(f"Server error: {e}", proxy))
 
-    formats_seen = describe_formats(info or {}, cookie_status)
+    formats_seen = describe_formats(info or {}, cookie_status, bool(proxy))
     print(f"[fetch_media] {url} format={fmt}: {formats_seen}", flush=True)
     # Each download gets its own fresh workdir, so the only finished file in it is ours.
     for f in os.listdir(workdir):

@@ -3,6 +3,23 @@
 All notable changes to this project. Format follows
 [Keep a Changelog](https://keepachangelog.com); dates are ISO 8601.
 
+## [3.3.0] - 2026-09-19
+
+### Added
+- `YTDLP_PROXY`: `/audio` and `/download` reach Instagram through a proxy.
+  Instagram sent this server a muted copy of a reel — `has_audio: false`, no
+  audio stream offered — logged in via `IG_COOKIES` or not, and after moving the
+  service from its original region to Singapore. The same code, on the same
+  yt-dlp route, from a home connection in India gets the sound. What differs is
+  that Railway is a data centre; a residential proxy removes that difference.
+  `/frames` stays direct: it never needs audio, and proxies bill per byte.
+- Errors and logs report `proxy on`/`off` and never the proxy address or its
+  password.
+
+### Changed
+- The 3.2.0 note that logging in fixes missing audio was wrong for this case.
+  `IG_COOKIES` stays useful for gated reels.
+
 ## [3.2.0] - 2026-09-19
 
 ### Added
