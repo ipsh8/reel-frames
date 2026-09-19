@@ -1,5 +1,5 @@
 """
-Reel Toolkit v3.1.1 — pure media extraction. No AI, no transcription, no analysis.
+Reel Toolkit v3.1.2 — pure media extraction. No AI, no transcription, no analysis.
 
 Endpoints (POST, require X-API-Key header):
   /frames    -> screenshots at intervals (JSON base64 or zip)
@@ -33,7 +33,7 @@ from starlette.background import BackgroundTask
 from mask_service import router as mask_router
 from audio_service import router as audio_router
 
-app = FastAPI(title="Reel Toolkit", version="3.1.1")
+app = FastAPI(title="Reel Toolkit", version="3.1.2")
 
 app.include_router(mask_router)
 app.include_router(audio_router)
@@ -102,13 +102,26 @@ VIDEO_FORMAT = "b/bv*+ba"
 MERGED_VIDEO_FORMAT = "bv*+ba"
 
 
-def fetch_media(url: str, workdir: str, fmt: str) -> str:
-    """Download an Instagram reel in the given yt-dlp format; return the local path.
+def describe_formats(info: dict, used_cookies: bool) -> str:
+    """Say which formats Instagram offered and which one was picked, for error messages.
 
-    Non-Instagram URLs are returned unchanged for ffmpeg to read directly.
+    Instagram can hand this server a different set of formats than a browser gets,
+    so this is the only way to see from n8n what the server was actually offered.
+    """
+    offered = ", ".join(f"{f.get('format_id')}={f.get('acodec') or '?'}"
+                        for f in info.get("formats") or [])
+    return (f"picked {info.get('format_id')}; offered (id=audio codec) {offered or 'none'}; "
+            f"cookies {'on' if used_cookies else 'off'}; yt-dlp {yt_dlp.version.__version__}")
+
+
+def fetch_media(url: str, workdir: str, fmt: str) -> tuple[str, str]:
+    """Download an Instagram reel in the given yt-dlp format.
+
+    Returns the local path and a describe_formats() summary. Non-Instagram URLs
+    are returned unchanged for ffmpeg to read directly.
     """
     if "instagram.com" not in url:
-        return url
+        return url, ""
 
     os.makedirs(workdir, exist_ok=True)
     ydl_opts = {
@@ -117,27 +130,29 @@ def fetch_media(url: str, workdir: str, fmt: str) -> str:
         'outtmpl': os.path.join(workdir, "media.%(ext)s"),
         'quiet': True,
         'no_warnings': True,
+        'noprogress': True,
     }
     
     cookies = os.getenv("IG_COOKIES_FILE")
-    if cookies and os.path.exists(cookies):
+    used_cookies = bool(cookies and os.path.exists(cookies))
+    if used_cookies:
         ydl_opts['cookiefile'] = cookies
 
     try:
-        # Execute download natively (no subprocess blocking or shell text parsing)
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            ydl.download([url])
-            
+            info = ydl.extract_info(url, download=True)
     except yt_dlp.utils.DownloadError as e:
         # Cleanly catch actual download failures (e.g., video deleted, rate limited)
         raise HTTPException(status_code=422, detail=f"Media download failed: {str(e)}")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Server error: {str(e)}")
 
+    formats_seen = describe_formats(info or {}, used_cookies)
+    print(f"[fetch_media] {url} format={fmt}: {formats_seen}", flush=True)
     # Each download gets its own fresh workdir, so the only finished file in it is ours.
     for f in os.listdir(workdir):
         if not f.endswith(".part") and not f.endswith(".ytdl"):
-            return os.path.join(workdir, f)
+            return os.path.join(workdir, f), formats_seen
 
     raise HTTPException(status_code=422, detail="yt-dlp finished but no file was found.")
 
@@ -152,11 +167,11 @@ def has_audio(path_or_url: str) -> bool:
 
 def fetch_video_with_audio(url: str, workdir: str) -> str:
     """Download the reel as a video that keeps its sound whenever the reel has any."""
-    muxed = fetch_media(url, os.path.join(workdir, "muxed"), VIDEO_FORMAT)
+    muxed, _ = fetch_media(url, os.path.join(workdir, "muxed"), VIDEO_FORMAT)
     if muxed == url or has_audio(muxed):
         return muxed
     try:
-        return fetch_media(url, os.path.join(workdir, "merged"), MERGED_VIDEO_FORMAT)
+        return fetch_media(url, os.path.join(workdir, "merged"), MERGED_VIDEO_FORMAT)[0]
     except HTTPException:
         # No separate audio stream either: the reel really is silent, so the video is all there is.
         return muxed
@@ -182,7 +197,7 @@ def extract_frames_from(source: str, req: FrameRequest, workdir: str) -> list[st
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "version": "3.1.1"}
+    return {"status": "ok", "version": "3.1.2"}
 
 
 @app.post("/frames", dependencies=[Depends(check_api_key)])
@@ -232,12 +247,14 @@ def audio(req: VideoRequest):
     """Extract the audio track as an mp3 file."""
     workdir = tempfile.mkdtemp(prefix="au_")
     try:
-        direct = fetch_media(req.video_url, os.path.join(workdir, "src"), AUDIO_FORMAT)
+        direct, formats_seen = fetch_media(req.video_url, os.path.join(workdir, "src"), AUDIO_FORMAT)
         if not has_audio(direct):
+            # Instagram can serve this server a muted copy of a reel that has sound in a
+            # browser (seen on Railway), so don't claim the reel itself is silent.
             raise HTTPException(
                 422,
-                "REEL_HAS_NO_AUDIO: Instagram serves no audio for this reel. It was "
-                "likely posted silent, or muted for unlicensed music.")
+                "REEL_HAS_NO_AUDIO: Instagram gave this server no audio for this reel. "
+                f"Formats: {formats_seen}")
         out_path = os.path.join(workdir, "audio.mp3")
         cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error",
                "-i", direct, "-vn", "-ac", "1", "-b:a", "64k", out_path]

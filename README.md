@@ -65,8 +65,12 @@ Every `POST` needs the `X-API-Key` header set to the `API_KEY` env var.
 
 ### Errors worth knowing
 
-- `422 REEL_HAS_NO_AUDIO` from `/audio`: Instagram serves no sound for that
-  reel. It was posted silent or muted for unlicensed music. Retrying won't help.
+- `422 REEL_HAS_NO_AUDIO` from `/audio`: Instagram gave the server no sound
+  for that reel. The reel may be silent, but Instagram can also give the server
+  a muted copy of a reel that plays with sound in a browser. The message lists
+  the formats the server was offered (`id=audio codec`, where `none` means no
+  audio and `?` means unknown), and the same line is in the Railway logs as
+  `[fetch_media]`.
 - `422 Media download failed: ...`: yt-dlp couldn't fetch the reel. It was
   deleted, it's private, or Instagram rate-limited the server. See
   `IG_COOKIES_FILE` below.

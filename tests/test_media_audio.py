@@ -55,8 +55,16 @@ class FakeInstagram:
             available.update({"ba": "audio_only", "bv*+ba": "merged"})
         for alternative in fmt.split("/"):
             if alternative in available:
-                return self.fixtures[available[alternative]]
+                return alternative, self.fixtures[available[alternative]]
         raise yt_dlp.utils.DownloadError(f"Requested format is not available: {fmt}")
+
+    def _formats(self):
+        # The pre-muxed file's codecs are unknown, as Instagram reports them.
+        formats = [{"format_id": "1", "acodec": None}]
+        if self.has_audio_stream:
+            formats += [{"format_id": "dash-a", "acodec": "mp4a.40.5"},
+                        {"format_id": "dash-v", "acodec": "none"}]
+        return formats
 
     def youtube_dl(self, opts):
         fake = self
@@ -68,11 +76,12 @@ class FakeInstagram:
             def __exit__(self, *exc):
                 return False
 
-            def download(self, urls):
+            def extract_info(self, url, download=True):
                 fake.requested_formats.append(opts["format"])
-                source = fake._pick(opts["format"])
+                picked, source = fake._pick(opts["format"])
                 ext = os.path.splitext(source)[1].lstrip(".")
                 shutil.copy(source, opts["outtmpl"].replace("%(ext)s", ext))
+                return {"format_id": picked, "formats": fake._formats()}
 
         return _YDL()
 
@@ -124,7 +133,10 @@ class MediaAudioTests(unittest.TestCase):
         self._serve(has_audio_stream=False)
         resp = self.client.post("/audio", json={"video_url": REEL_URL}, headers=HEADERS)
         self.assertEqual(resp.status_code, 422)
-        self.assertIn("REEL_HAS_NO_AUDIO", resp.json()["detail"])
+        detail = resp.json()["detail"]
+        self.assertIn("REEL_HAS_NO_AUDIO", detail)
+        # Says what Instagram offered the server, since a browser may be offered more.
+        self.assertIn("picked b; offered (id=audio codec) 1=?", detail)
 
     def test_download_merges_the_audio_back_in_when_the_muxed_file_is_silent(self):
         fake = self._serve(has_audio_stream=True)

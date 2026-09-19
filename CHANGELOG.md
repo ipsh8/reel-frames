@@ -3,6 +3,15 @@
 All notable changes to this project. Format follows
 [Keep a Changelog](https://keepachangelog.com); dates are ISO 8601.
 
+## [3.1.2] - 2026-09-19
+
+### Changed
+- `REEL_HAS_NO_AUDIO` no longer claims the reel is silent. After 3.1.1 went
+  live, Railway got no audio for a reel that has sound when fetched from
+  elsewhere, so the error (and a `[fetch_media]` log line) now lists the
+  formats Instagram offered the server, whether cookies were used, and the
+  yt-dlp version. That shows what the server is actually offered.
+
 ## [3.1.1] - 2026-09-19
 
 Shipped in [37426a0](https://github.com/ipsh8/reel-frames/commit/37426a0).
