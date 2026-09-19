@@ -70,10 +70,13 @@ Every `POST` needs the `X-API-Key` header set to the `API_KEY` env var.
   a muted copy of a reel that plays with sound in a browser. The message lists
   the formats the server was offered (`id=audio codec`, where `none` means no
   audio and `?` means unknown), and the same line is in the Railway logs as
-  `[fetch_media]`.
+  `[fetch_media]`. If it ends `cookies off`, set `IG_COOKIES` (below): logged
+  out, Instagram withholds the audio stream from Railway for some reels that a
+  home connection gets with sound. `cookies on (IG_COOKIES, but no sessionid…)`
+  means what was pasted isn't a login.
 - `422 Media download failed: ...`: yt-dlp couldn't fetch the reel. It was
   deleted, it's private, or Instagram rate-limited the server. See
-  `IG_COOKIES_FILE` below.
+  `IG_COOKIES` below.
 
 ## Examples
 
@@ -112,10 +115,26 @@ See `.env.example`.
 | Var | Default | |
 |---|---|---|
 | `API_KEY` | — | **required**; clients send it as `X-API-Key` |
-| `IG_COOKIES_FILE` | — | optional path to a Netscape `cookies.txt` for yt-dlp, for gated/private reels |
+| `IG_COOKIES` | — | optional; the `Cookie` header from a logged-in instagram.com request, pasted as one line (`sessionid=…; csrftoken=…`). Logs the server in, so Instagram stops withholding audio. Use a throwaway account |
+| `IG_COOKIES_FILE` | — | optional path to a Netscape `cookies.txt`; used instead of `IG_COOKIES` when both are set |
 | `FFMPEG_TIMEOUT` | 180 | seconds per ffmpeg/ffprobe run |
 | `YTDLP_TIMEOUT` | 60 | seconds for yt-dlp to resolve a URL (`/frames`) |
 | `HARD_MAX_FRAMES` | 300 | server-side cap on `max_frames` |
+
+### Getting `IG_COOKIES`
+
+1. Log in to instagram.com in Chrome **with a throwaway account** — automated
+   downloading can get an account flagged.
+2. Open DevTools (Cmd+Option+I) → **Network** tab → reload the page.
+3. Click the first request to `www.instagram.com`, then under **Request
+   Headers** copy the value of `cookie`.
+4. In Railway → this service → **Variables**, add `IG_COOKIES` with that value.
+5. Don't log out in that browser — logging out cancels the session the server
+   is using. Just close the tab.
+
+The value is a login. Keep it out of git, chat and logs. When Instagram
+eventually ends the session, errors say `cookies on` but audio disappears again;
+repeat the steps with a fresh copy.
 
 `yt-dlp` is unpinned in `requirements.txt`, so each Railway rebuild picks up
 the latest release. Instagram changes often, so if fetching breaks, redeploying

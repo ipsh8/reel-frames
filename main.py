@@ -1,5 +1,5 @@
 """
-Reel Toolkit v3.1.2 — pure media extraction. No AI, no transcription, no analysis.
+Reel Toolkit v3.2.0 — pure media extraction. No AI, no transcription, no analysis.
 
 Endpoints (POST, require X-API-Key header):
   /frames    -> screenshots at intervals (JSON base64 or zip)
@@ -14,7 +14,11 @@ Instagram's pre-muxed files don't say whether they carry sound, and some don't.
 
 Env vars:
   API_KEY          required — clients must send it as X-API-Key
-  IG_COOKIES_FILE  optional cookies.txt for gated Instagram content
+  IG_COOKIES       optional Cookie header from a logged-in Instagram browser session
+                   ("sessionid=...; csrftoken=..."). Without a login Instagram can
+                   withhold a reel's audio from this server.
+  IG_COOKIES_FILE  optional path to a Netscape cookies.txt; used instead of
+                   IG_COOKIES when both are set
 """
 import yt_dlp
 import base64
@@ -22,6 +26,8 @@ import os
 import shutil
 import subprocess
 import tempfile
+import threading
+import time
 import uuid
 import zipfile
 from typing import Literal, Optional
@@ -33,7 +39,7 @@ from starlette.background import BackgroundTask
 from mask_service import router as mask_router
 from audio_service import router as audio_router
 
-app = FastAPI(title="Reel Toolkit", version="3.1.2")
+app = FastAPI(title="Reel Toolkit", version="3.2.0")
 
 app.include_router(mask_router)
 app.include_router(audio_router)
@@ -66,11 +72,72 @@ class VideoRequest(BaseModel):
     video_url: str
 
 
+_cookie_lock = threading.Lock()
+_cookie_cache: dict = {}   # raw IG_COOKIES value -> path of the file made from it
+
+
+def _cookies_to_netscape(raw: str) -> tuple[str, bool]:
+    """Turn a browser Cookie header into the cookies.txt format yt-dlp reads.
+
+    The header is what DevTools shows for a request to instagram.com, and is the
+    easiest thing to copy out of a browser. yt-dlp only reads the Netscape file
+    format, so each name=value pair becomes one line of it. Returns the file text
+    and whether a `sessionid` was among them — without one, the cookies are not a
+    login and Instagram will treat the server as logged out regardless.
+    """
+    raw = raw.strip()
+    # Only unwrap quotes around the WHOLE paste. A header never starts with a
+    # quote, but its last value often ends with one — Instagram's `rur` is
+    # quoted — and stripping trailing quotes blindly corrupts that cookie.
+    if raw[:1] in ("'", '"') and raw[-1:] == raw[:1]:
+        raw = raw[1:-1].strip()
+    if raw.lower().startswith("cookie:"):
+        raw = raw[len("cookie:"):]
+    # A year out: an empty expiry makes these session cookies, which cookie
+    # jars drop on load unless told otherwise.
+    expires = str(int(time.time()) + 365 * 24 * 3600)
+    lines = ["# Netscape HTTP Cookie File"]
+    names = set()
+    for pair in raw.split(";"):
+        name, sep, value = pair.strip().partition("=")   # values may contain "="
+        if not sep or not name:
+            continue
+        names.add(name)
+        lines.append("\t".join([".instagram.com", "TRUE", "/", "TRUE", expires, name, value]))
+    return "\n".join(lines) + "\n", "sessionid" in names
+
+
+def cookie_file() -> tuple[Optional[str], str]:
+    """The cookies file yt-dlp should use, and a short status for logs and errors.
+
+    IG_COOKIES_FILE wins when it points at a real file. Otherwise IG_COOKIES is
+    converted once and kept for the life of the process — Railway restarts the
+    service when a variable changes, so a stale conversion cannot outlive it.
+    """
+    path = os.getenv("IG_COOKIES_FILE")
+    if path and os.path.exists(path):
+        return path, "on (IG_COOKIES_FILE)"
+    raw = os.getenv("IG_COOKIES", "").strip()
+    if not raw:
+        return None, "off"
+    with _cookie_lock:
+        if raw not in _cookie_cache:
+            text, logged_in = _cookies_to_netscape(raw)
+            # mkstemp creates the file readable by this user only; it holds a login.
+            fd, made = tempfile.mkstemp(prefix="ig-cookies-", suffix=".txt")
+            with os.fdopen(fd, "w") as fh:
+                fh.write(text)
+            _cookie_cache[raw] = (made, logged_in)
+        made, logged_in = _cookie_cache[raw]
+    return made, ("on (IG_COOKIES)" if logged_in
+                  else "on (IG_COOKIES, but no sessionid, so not logged in)")
+
+
 def _ytdlp_cookies(cmd: list) -> list:
-    """Insert --cookies right after the yt-dlp binary, if a cookie file is configured."""
-    cookies = os.getenv("IG_COOKIES_FILE")
-    if cookies and os.path.exists(cookies):
-        cmd[1:1] = ["--cookies", cookies]
+    """Insert --cookies right after the yt-dlp binary, if cookies are configured."""
+    path, _ = cookie_file()
+    if path:
+        cmd[1:1] = ["--cookies", path]
     return cmd
 
 
@@ -102,7 +169,7 @@ VIDEO_FORMAT = "b/bv*+ba"
 MERGED_VIDEO_FORMAT = "bv*+ba"
 
 
-def describe_formats(info: dict, used_cookies: bool) -> str:
+def describe_formats(info: dict, cookies: str) -> str:
     """Say which formats Instagram offered and which one was picked, for error messages.
 
     Instagram can hand this server a different set of formats than a browser gets,
@@ -111,7 +178,7 @@ def describe_formats(info: dict, used_cookies: bool) -> str:
     offered = ", ".join(f"{f.get('format_id')}={f.get('acodec') or '?'}"
                         for f in info.get("formats") or [])
     return (f"picked {info.get('format_id')}; offered (id=audio codec) {offered or 'none'}; "
-            f"cookies {'on' if used_cookies else 'off'}; yt-dlp {yt_dlp.version.__version__}")
+            f"cookies {cookies}; yt-dlp {yt_dlp.version.__version__}")
 
 
 def fetch_media(url: str, workdir: str, fmt: str) -> tuple[str, str]:
@@ -133,9 +200,8 @@ def fetch_media(url: str, workdir: str, fmt: str) -> tuple[str, str]:
         'noprogress': True,
     }
     
-    cookies = os.getenv("IG_COOKIES_FILE")
-    used_cookies = bool(cookies and os.path.exists(cookies))
-    if used_cookies:
+    cookies, cookie_status = cookie_file()
+    if cookies:
         ydl_opts['cookiefile'] = cookies
 
     try:
@@ -147,7 +213,7 @@ def fetch_media(url: str, workdir: str, fmt: str) -> tuple[str, str]:
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Server error: {str(e)}")
 
-    formats_seen = describe_formats(info or {}, used_cookies)
+    formats_seen = describe_formats(info or {}, cookie_status)
     print(f"[fetch_media] {url} format={fmt}: {formats_seen}", flush=True)
     # Each download gets its own fresh workdir, so the only finished file in it is ours.
     for f in os.listdir(workdir):

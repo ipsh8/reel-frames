@@ -3,6 +3,19 @@
 All notable changes to this project. Format follows
 [Keep a Changelog](https://keepachangelog.com); dates are ISO 8601.
 
+## [3.2.0] - 2026-09-19
+
+### Added
+- `IG_COOKIES`: paste the `Cookie` header from a logged-in instagram.com
+  request into a Railway variable and the server downloads as that account.
+  Logged out, Instagram withheld the audio stream from Railway for a reel that
+  has sound — the same reel, same yt-dlp version, fetched logged-out from a
+  home connection, was offered it — so `/audio` failed with
+  `REEL_HAS_NO_AUDIO`. `IG_COOKIES_FILE` needed a file on the server's disk,
+  which a Railway deploy has no way to receive without committing a login.
+- Errors and logs now say where cookies came from, and flag cookies with no
+  `sessionid` — what a logged-out browser has — as not a login.
+
 ## [3.1.2] - 2026-09-19
 
 Shipped in [5211ae5](https://github.com/ipsh8/reel-frames/commit/5211ae5).
