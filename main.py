@@ -1,5 +1,5 @@
 """
-Reel Toolkit v3.1 — pure media extraction. No AI, no transcription, no analysis.
+Reel Toolkit v3.1.1 — pure media extraction. No AI, no transcription, no analysis.
 
 Endpoints (POST, require X-API-Key header):
   /frames    -> screenshots at intervals (JSON base64 or zip)
@@ -7,10 +7,10 @@ Endpoints (POST, require X-API-Key header):
   /download  -> the reel video itself as an .mp4 file
   /health    -> liveness check (GET, no auth)
 
-v3.1 change: /audio and /download now DOWNLOAD and MERGE the media instead of
-resolving a single stream URL. Instagram serves some reels as separate video and
-audio streams; grabbing one stream URL gave a soundless file. /frames still uses
-the fast URL path because frames never need audio.
+/audio downloads Instagram's audio-only stream. /download takes the pre-muxed MP4
+and, if that file turns out silent, merges the video and audio streams instead.
+Instagram's pre-muxed files don't say whether they carry sound, and some don't.
+/frames uses the fast URL path because frames never need audio.
 
 Env vars:
   API_KEY          required — clients must send it as X-API-Key
@@ -33,7 +33,7 @@ from starlette.background import BackgroundTask
 from mask_service import router as mask_router
 from audio_service import router as audio_router
 
-app = FastAPI(title="Reel Toolkit", version="3.1.0")
+app = FastAPI(title="Reel Toolkit", version="3.1.1")
 
 app.include_router(mask_router)
 app.include_router(audio_router)
@@ -92,28 +92,29 @@ def resolve_url(url: str, fmt: str = "best[ext=mp4]/best") -> str:
     return out.stdout.strip().splitlines()[0]
 
 
-import os
-import yt_dlp
-from fastapi import HTTPException
+# Instagram lists its pre-muxed MP4s ("b") with unknown codecs, and some of them
+# have no audio track. yt-dlp can't tell, so "b" alone can hand back a silent
+# file. The audio-only DASH stream ("ba") is the one format guaranteed to carry sound.
+AUDIO_FORMAT = "ba/b"
+# Pre-muxed first keeps the H.264 file downstream nodes already get; the merge
+# (VP9 video + the audio stream) is the fallback for when that file is silent.
+VIDEO_FORMAT = "b/bv*+ba"
+MERGED_VIDEO_FORMAT = "bv*+ba"
 
-def fetch_media(url: str, workdir: str) -> str:
-    """
-    Downloads media natively using yt-dlp.
-    Engineered to guarantee audio presence and handle dynamic extensions safely.
+
+def fetch_media(url: str, workdir: str, fmt: str) -> str:
+    """Download an Instagram reel in the given yt-dlp format; return the local path.
+
+    Non-Instagram URLs are returned unchanged for ffmpeg to read directly.
     """
     if "instagram.com" not in url:
         return url
 
-    # We let yt-dlp determine the final extension based on the actual stream container
-    out_tmpl = os.path.join(workdir, "media.%(ext)s")
-    
+    os.makedirs(workdir, exist_ok=True)
     ydl_opts = {
-        # THE MAGIC BULLET: 'b/bv+ba'
-        # Instead of prioritizing separate streams (which break on IG), we prioritize 'b'.
-        # 'b' grabs the legacy pre-muxed MP4 file that GUARANTEES both video and audio 
-        # are baked into a single file. It only falls back to merging if 'b' is missing.
-        'format': 'b/bv+ba',
-        'outtmpl': out_tmpl,
+        'format': fmt,
+        # yt-dlp picks the extension from the stream it actually gets (mp4, m4a, ...)
+        'outtmpl': os.path.join(workdir, "media.%(ext)s"),
         'quiet': True,
         'no_warnings': True,
     }
@@ -133,15 +134,33 @@ def fetch_media(url: str, workdir: str) -> str:
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Server error: {str(e)}")
 
-    # THE FOOLPROOF FILE LOCATOR
-    # Because your endpoints create a unique temp 'workdir' for every single request, 
-    # we know the only finished media file sitting in this folder is our successful download.
-    # This prevents extension guessing errors (like expecting .mp4 but getting .webm).
+    # Each download gets its own fresh workdir, so the only finished file in it is ours.
     for f in os.listdir(workdir):
         if not f.endswith(".part") and not f.endswith(".ytdl"):
             return os.path.join(workdir, f)
-            
+
     raise HTTPException(status_code=422, detail="yt-dlp finished but no file was found.")
+
+
+def has_audio(path_or_url: str) -> bool:
+    out = subprocess.run(
+        ["ffprobe", "-v", "error", "-select_streams", "a",
+         "-show_entries", "stream=codec_type", "-of", "csv=p=0", path_or_url],
+        capture_output=True, text=True, timeout=FFMPEG_TIMEOUT)
+    return "audio" in out.stdout
+
+
+def fetch_video_with_audio(url: str, workdir: str) -> str:
+    """Download the reel as a video that keeps its sound whenever the reel has any."""
+    muxed = fetch_media(url, os.path.join(workdir, "muxed"), VIDEO_FORMAT)
+    if muxed == url or has_audio(muxed):
+        return muxed
+    try:
+        return fetch_media(url, os.path.join(workdir, "merged"), MERGED_VIDEO_FORMAT)
+    except HTTPException:
+        # No separate audio stream either: the reel really is silent, so the video is all there is.
+        return muxed
+
 
 def extract_frames_from(source: str, req: FrameRequest, workdir: str) -> list[str]:
     vf = f"fps=1/{req.interval}"
@@ -163,7 +182,7 @@ def extract_frames_from(source: str, req: FrameRequest, workdir: str) -> list[st
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "version": "3.1.0"}
+    return {"status": "ok", "version": "3.1.1"}
 
 
 @app.post("/frames", dependencies=[Depends(check_api_key)])
@@ -213,8 +232,12 @@ def audio(req: VideoRequest):
     """Extract the audio track as an mp3 file."""
     workdir = tempfile.mkdtemp(prefix="au_")
     try:
-        # download + merge, so split-stream reels still yield sound
-        direct = fetch_media(req.video_url, workdir)
+        direct = fetch_media(req.video_url, os.path.join(workdir, "src"), AUDIO_FORMAT)
+        if not has_audio(direct):
+            raise HTTPException(
+                422,
+                "REEL_HAS_NO_AUDIO: Instagram serves no audio for this reel. It was "
+                "likely posted silent, or muted for unlicensed music.")
         out_path = os.path.join(workdir, "audio.mp3")
         cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error",
                "-i", direct, "-vn", "-ac", "1", "-b:a", "64k", out_path]
@@ -242,8 +265,7 @@ def audio(req: VideoRequest):
 def download(req: VideoRequest):
     workdir = tempfile.mkdtemp(prefix="dl_")
     try:
-        # download + merge, so the saved mp4 actually carries its audio track
-        direct = fetch_media(req.video_url, workdir)
+        direct = fetch_video_with_audio(req.video_url, workdir)
         out_path = os.path.join(workdir, "video.mp4")
         cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error",
                "-i", direct, "-c", "copy", "-movflags", "+faststart", out_path]
