@@ -5,6 +5,8 @@ All notable changes to this project. Format follows
 
 ## [3.1.2] - 2026-09-19
 
+Shipped in [5211ae5](https://github.com/ipsh8/reel-frames/commit/5211ae5).
+
 ### Changed
 - `REEL_HAS_NO_AUDIO` no longer claims the reel is silent. After 3.1.1 went
   live, Railway got no audio for a reel that has sound when fetched from
