@@ -263,7 +263,9 @@ def extract_frames_from(source: str, req: FrameRequest, workdir: str) -> list[st
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "version": "3.1.2"}
+    # Read from the app rather than typed here: a hand-written copy went stale
+    # on the 3.2.0 bump and kept reporting 3.1.2 after the deploy.
+    return {"status": "ok", "version": app.version}
 
 
 @app.post("/frames", dependencies=[Depends(check_api_key)])

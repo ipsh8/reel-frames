@@ -128,5 +128,12 @@ class CookieFile(unittest.TestCase):
         self.assertIn("cookies on (IG_COOKIES)", summary)
 
 
+class Health(unittest.TestCase):
+    def test_health_reports_the_version_actually_running(self):
+        from fastapi.testclient import TestClient
+        body = TestClient(main.app).get("/health").json()
+        self.assertEqual(body["version"], main.app.version)
+
+
 if __name__ == "__main__":
     unittest.main()
