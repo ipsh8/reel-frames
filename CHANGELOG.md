@@ -5,6 +5,8 @@ All notable changes to this project. Format follows
 
 ## [3.1.1] - 2026-09-19
 
+Shipped in [37426a0](https://github.com/ipsh8/reel-frames/commit/37426a0).
+
 ### Fixed
 - `/audio` failed with `422 No audio track found ... Output file does not
   contain any stream` on reels that do have sound. The service downloaded
