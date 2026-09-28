@@ -90,6 +90,15 @@ def dissolve(workdir):
     return out
 
 
+def caption_pop(workdir):
+    """One static shot; at 1.0 s a white caption block appears in the lower third."""
+    out = os.path.join(workdir, "caption.mp4")
+    ffmpeg("-loop", "1", "-i", still(workdir), "-t", "2", "-r", str(FPS),
+           "-vf", f"scale={W}:{H},drawbox=enable='gte(t,1)':x=60:y=420:w=240:h=70:color=white:t=fill",
+           "-pix_fmt", "yuv420p", out)
+    return out
+
+
 def click_track(workdir, every=0.5, seconds=4):
     """Static video with a short 1 kHz blip every `every` seconds."""
     out = os.path.join(workdir, "clicks.mp4")
