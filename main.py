@@ -1,18 +1,23 @@
 """
-Reel Toolkit v3.4.0 — media extraction and edit measurement. No AI, no transcription.
+Reel Toolkit v3.5.0 — media extraction and edit measurement for Instagram reels
+and YouTube videos. No AI, no transcription.
 
 Endpoints (POST, require X-API-Key header):
-  /frames    -> screenshots at intervals (JSON base64 or zip)
-  /audio     -> the reel's audio track as an .mp3 file
-  /download  -> the reel video itself as an .mp4 file
-  /analyze   -> evidence pack for reverse-engineering the edit: cuts, camera
-                moves, audio onsets, contact sheets, transition strips (zip)
-  /health    -> liveness check (GET, no auth)
+  /frames      -> screenshots at intervals, or at scene changes with mode=scene
+                  (JSON base64 or zip)
+  /audio       -> the video's audio track as an .mp3 file
+  /download    -> the video itself as an .mp4 file
+  /transcript  -> YouTube only: info.json (title, chapters, ...) plus English
+                  subtitles when they exist (zip or JSON)
+  /analyze     -> evidence pack for reverse-engineering the edit: cuts, camera
+                  moves, audio onsets, contact sheets, transition strips (zip)
+  /health      -> liveness check (GET, no auth)
 
 /audio downloads Instagram's audio-only stream. /download takes the pre-muxed MP4
 and, if that file turns out silent, merges the video and audio streams instead.
 Instagram's pre-muxed files don't say whether they carry sound, and some don't.
 /frames uses the fast URL path because frames never need audio.
+YouTube links are downloaded once (720p max) and cached; see youtube_service.py.
 
 Env vars:
   API_KEY          required — clients must send it as X-API-Key
@@ -22,10 +27,15 @@ Env vars:
   IG_COOKIES_FILE  optional path to a Netscape cookies.txt; used instead of
                    IG_COOKIES when both are set
   ANALYZE_MAX_SECONDS  longest video /analyze accepts (default 180)
-  YTDLP_PROXY      optional proxy for /audio and /download
-                   (http://user:pass@host:port). Instagram serves this server
-                   muted copies of some reels; through a residential proxy it
-                   serves the same copy a phone gets, sound included.
+  YTDLP_PROXY      optional proxy for /audio and /download, and for every
+                   YouTube request (http://user:pass@host:port). Instagram serves
+                   this server muted copies of some reels; through a residential
+                   proxy it serves the same copy a phone gets, sound included.
+  YT_COOKIES_FILE / YT_COOKIES_B64  optional YouTube cookies.txt (path, or its
+                   base64) for when YouTube bot-checks the server
+  YT_CACHE_SECONDS     how long a downloaded YouTube video is kept (default 3600)
+  SCENE_MAX_FRAMES     most frames scene mode returns (default 600)
+  FFMPEG_SCENE_TIMEOUT seconds scene mode may take (default 1200)
 """
 import yt_dlp
 import base64
@@ -48,8 +58,9 @@ from mask_service import router as mask_router
 from audio_service import router as audio_router
 from analyze_service import router as analyze_router
 import youtube_service
+from scene_frames import extract_scene_frames
 
-app = FastAPI(title="Reel Toolkit", version="3.4.0")
+app = FastAPI(title="Reel Toolkit", version="3.5.0")
 
 app.include_router(mask_router)
 app.include_router(audio_router)
@@ -58,6 +69,9 @@ FFMPEG_TIMEOUT = int(os.getenv("FFMPEG_TIMEOUT", "180"))
 YTDLP_TIMEOUT = int(os.getenv("YTDLP_TIMEOUT", "60"))
 YTDLP_DOWNLOAD_TIMEOUT = int(os.getenv("YTDLP_DOWNLOAD_TIMEOUT", str(YTDLP_TIMEOUT * 4)))
 HARD_MAX_FRAMES = int(os.getenv("HARD_MAX_FRAMES", "300"))
+SCENE_MAX_FRAMES = int(os.getenv("SCENE_MAX_FRAMES", "600"))
+# Scene mode decodes the whole video; 30 minutes of 720p takes a few minutes on Railway's CPU.
+FFMPEG_SCENE_TIMEOUT = int(os.getenv("FFMPEG_SCENE_TIMEOUT", "1200"))
 
 
 def check_api_key(x_api_key: str = Header(None)):
@@ -73,13 +87,17 @@ app.include_router(youtube_service.router, dependencies=[Depends(check_api_key)]
 
 
 class FrameRequest(BaseModel):
-    video_url: str = Field(..., description="Direct .mp4 URL or instagram.com page URL")
+    video_url: str = Field(..., description="Direct .mp4 URL, instagram.com or YouTube link")
     interval: float = Field(2.0, gt=0.05, le=60)
-    max_frames: int = Field(60, ge=1, le=HARD_MAX_FRAMES)
+    max_frames: int = Field(60, ge=1, le=max(HARD_MAX_FRAMES, SCENE_MAX_FRAMES))
     width: Optional[int] = Field(None, ge=64, le=1920)
     quality: int = Field(2, ge=1, le=31)
     output: Literal["zip", "json"] = "zip"
     start: float = Field(0.0, ge=0)
+    mode: Literal["interval", "scene"] = "interval"
+    scene_threshold: float = Field(0.3, gt=0, lt=1)
+    min_gap: float = Field(3.0, ge=0.5, le=600)
+    max_gap: float = Field(60.0, ge=1, le=3600)
 
 
 class VideoRequest(BaseModel):
@@ -320,14 +338,26 @@ def health():
 def frames(req: FrameRequest):
     workdir = tempfile.mkdtemp(prefix="frames_")
     try:
+        limit = SCENE_MAX_FRAMES if req.mode == "scene" else HARD_MAX_FRAMES
+        if req.max_frames > limit:
+            raise HTTPException(422, f"max_frames is at most {limit} in {req.mode} mode")
         # frames need VIDEO only — keep the fast URL path, no download, no merge
         direct = resolve_url(req.video_url)
-        paths = extract_frames_from(direct, req, workdir)
-        timestamps = [round(req.start + i * req.interval, 3) for i in range(len(paths))]
+        if req.mode == "scene":
+            picked = extract_scene_frames(
+                direct, start=req.start, threshold=req.scene_threshold, min_gap=req.min_gap,
+                max_gap=req.max_gap, max_frames=req.max_frames, width=req.width,
+                quality=req.quality, workdir=workdir, timeout=FFMPEG_SCENE_TIMEOUT)
+            paths = [p for p, _ in picked]
+            timestamps = [round(t, 3) for _, t in picked]
+        else:
+            paths = extract_frames_from(direct, req, workdir)
+            timestamps = [round(req.start + i * req.interval, 3) for i in range(len(paths))]
 
         if req.output == "json":
             payload = {
                 "count": len(paths),
+                "mode": req.mode,
                 "interval": req.interval,
                 "frames": [
                     {
