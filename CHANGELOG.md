@@ -3,6 +3,31 @@
 All notable changes to this project. Format follows
 [Keep a Changelog](https://keepachangelog.com); dates are ISO 8601.
 
+## [3.5.0] - 2026-09-28
+
+### Added
+- YouTube links work on every endpoint: full videos, Shorts, `youtu.be`,
+  live and embed links. Playlist and time parameters are dropped, so one link
+  always means one video. ([20a2648](https://github.com/ipsh8/reel-frames/commit/20a2648))
+- Each YouTube video is downloaded once (720p max, mp4 with sound) and reused
+  by `/download`, `/frames`, `/audio` and `/transcript` for `YT_CACHE_SECONDS`,
+  so YouTube's bot checks see one request per video. YouTube requests use
+  `YTDLP_PROXY` and optional `YT_COOKIES_B64` / `YT_COOKIES_FILE`.
+  ([a7bc121](https://github.com/ipsh8/reel-frames/commit/a7bc121))
+- `POST /transcript`: a YouTube video's `info.json` (title, chapters,
+  description) plus English subtitles when they exist. It prefers
+  people-written subtitles and reports `manual`, `auto`, `none` or `blocked`
+  instead of failing. ([511801c](https://github.com/ipsh8/reel-frames/commit/511801c))
+- `/frames` `mode: "scene"`: frames at scene changes, spaced by `min_gap`, with
+  one at least every `max_gap`, for long videos where a fixed interval gives
+  hundreds of near-duplicates. New `SCENE_MAX_FRAMES` and
+  `FFMPEG_SCENE_TIMEOUT`. ([181124c](https://github.com/ipsh8/reel-frames/commit/181124c))
+- Feature doc: `docs/features/2026-09-28-youtube-videos.md`.
+
+### Changed
+- The Docker image includes Deno, and the requirements use `yt-dlp[default]`,
+  which YouTube downloads now need. ([2e8f33f](https://github.com/ipsh8/reel-frames/commit/2e8f33f))
+
 ## [3.4.0] - 2026-09-28
 
 ### Added
