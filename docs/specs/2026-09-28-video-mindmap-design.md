@@ -57,9 +57,10 @@ YouTube:
    - `map.json`, the single source of truth for the map
    - a Whimsical mind map with a code and a timestamp link on every node
    - a private "frame atlas" artifact with one card per node code
-6. **"Expand node X" works from a screenshot.** Children added later are
-   tagged 🎬 *from the video* or 🔍 *added research*, and edits the user made
-   by hand in Whimsical are kept.
+6. **"Expand node X" works from a screenshot.** Edits the user made by hand
+   in Whimsical are kept, and every node shows where it came from:
+   - A timestamp (`▶ mm:ss`) marks a node taken from the video.
+   - `🔍` marks added research.
 
 ## Non-goals
 
@@ -137,7 +138,7 @@ atlas card, so reading it off a screenshot finds exactly one node.
 | `reel-frames/youtube_service.py` (new) | `YT_COOKIES` / `YT_COOKIES_FILE` are kept separate from the IG cookies. For YouTube, `YTDLP_PROXY` is applied on every endpoint. Format is `bv*[height<=720]+ba/b[height<=720]`, merged to mp4. |
 | download cache | The first fetch of a YouTube URL is kept in `/tmp` for `YT_CACHE_SECONDS` (default 3600). `/download`, `/frames` and `/transcript` reuse it, so YouTube is hit once per video. |
 | `/frames` | New `mode: "scene"` with `scene_threshold` (default 0.3), `min_gap` (default 3 s) and `max_frames`. `HARD_MAX_FRAMES` is raised to 600 for scene mode. `mode: "interval"` stays the default. |
-| `/transcript` (new) | Returns a zip of `info.json` and `transcript.vtt`, with manual subtitles preferred over auto ones. With no English subtitles it returns `422 NO_SUBTITLES`. |
+| `/transcript` (new) | Returns `info.json`, plus `transcript.vtt` when English subtitles exist, as a zip or as JSON (`output`). The `X-Transcript` header says `manual`, `auto`, `none` or `blocked`. Missing subtitles are never an error, because n8n needs `info.json` either way. |
 | `Dockerfile` | Adds Deno (`COPY --from=denoland/deno:bin /deno /usr/local/bin/deno`) for yt-dlp's YouTube JS challenges. |
 | n8n **REEL FRAMES to Drive** | Detects the kind in Build Reel Items. A Switch sends each link to the reel path or the YouTube path. The YouTube path has a 900 s timeout. The ready message links each video's own folder. |
 | n8n fixes (found in review) | Report Reel Failure uses the wrong Telegram bot (Navvya instead of Reel Frames), so it now uses the trigger's bot. The service API key moves out of the node parameters into an n8n Header Auth credential. |
