@@ -19,6 +19,12 @@ import numpy as np
 PEAK_MIN = 0.08          # a cut changes at least this much of the picture (mean abs, 0..1)
 GRAPHIC_MIN = 0.02       # an overlay (caption, sticker) can be much smaller than a cut
 PEAK_RATIO = 3.0         # ...and at least this many times the local typical change
+# Busy shots (walking legs, crowds) raise the "typical change", so a clear cut
+# next to one can miss the ratio. A strong change across nearly the whole frame
+# is let through at a lower ratio.
+WIDE_PEAK_MIN = 0.15
+WIDE_SPREAD = 0.8
+WIDE_RATIO = 2.0
 LOCAL_RADIUS = 8
 MERGE_GAP = 3            # peaks this close are one edit (e.g. into and out of a flash frame)
 FLASH_RISE = 25          # luma units above the surroundings
@@ -73,7 +79,7 @@ def _local_median(x, f, radius):
     return float(np.median(around)) if len(around) else 0.0
 
 
-def _peaks(change, minimum):
+def _peaks(change, spread, minimum):
     """Frames where the camera-compensated change spikes above its surroundings."""
     found = []
     for f in range(1, len(change)):
@@ -82,9 +88,11 @@ def _peaks(change, minimum):
             continue
         if d < change[max(1, f - 3):f + 4].max():
             continue
-        if d < PEAK_RATIO * _local_median(change, f, LOCAL_RADIUS) + 0.02:
-            continue
-        found.append(f)
+        typical = _local_median(change, f, LOCAL_RADIUS)
+        clear_spike = d >= PEAK_RATIO * typical + 0.02
+        wide_cut = d >= WIDE_PEAK_MIN and spread[f] >= WIDE_SPREAD and d >= WIDE_RATIO * typical
+        if clear_spike or wide_cut:
+            found.append(f)
     return found
 
 
@@ -175,7 +183,7 @@ def _dissolves(sig, taken):
 def detect_cuts(sig):
     cuts = []
     taken = set()
-    for group in _group(_peaks(sig.comp, GRAPHIC_MIN)):
+    for group in _group(_peaks(sig.comp, sig.spread, GRAPHIC_MIN)):
         first, last = group[0], group[-1]
         spread = float(max(sig.spread[f] for f in group))
         score = float(max(sig.comp[f] for f in group))
