@@ -47,6 +47,7 @@ from starlette.background import BackgroundTask
 from mask_service import router as mask_router
 from audio_service import router as audio_router
 from analyze_service import router as analyze_router
+import youtube_service
 
 app = FastAPI(title="Reel Toolkit", version="3.4.0")
 
@@ -177,12 +178,15 @@ def _ytdlp_cookies(cmd: list) -> list:
 
 
 def resolve_url(url: str, fmt: str = "best[ext=mp4]/best") -> str:
-    """Resolve an Instagram page URL to ONE direct stream URL. Fast, no download.
+    """Resolve an Instagram or YouTube page URL to ONE direct stream URL. Fast, no download.
 
     NOTE: this cannot merge separate video/audio streams. Use it only where audio
     does not matter (i.e. /frames). For anything needing sound, use fetch_media().
     """
-    if "instagram.com" not in url:
+    kind = youtube_service.classify_url(url)
+    if kind == "youtube":
+        return youtube_service.cached_video(url)
+    if kind != "instagram":
         return url
     cmd = _ytdlp_cookies(["yt-dlp", "-g", "-f", fmt, "--no-warnings", url])
     try:
@@ -218,12 +222,15 @@ def describe_formats(info: dict, cookies: str, proxy: bool = False) -> str:
 
 
 def fetch_media(url: str, workdir: str, fmt: str) -> tuple[str, str]:
-    """Download an Instagram reel in the given yt-dlp format.
+    """Download an Instagram reel (or return the cached YouTube video) in the given yt-dlp format.
 
     Returns the local path and a describe_formats() summary. Non-Instagram URLs
     are returned unchanged for ffmpeg to read directly.
     """
-    if "instagram.com" not in url:
+    kind = youtube_service.classify_url(url)
+    if kind == "youtube":
+        return youtube_service.cached_video(url), "youtube (cached download)"
+    if kind != "instagram":
         return url, ""
 
     os.makedirs(workdir, exist_ok=True)
@@ -388,6 +395,10 @@ def audio(req: VideoRequest):
 
 @app.post("/download", dependencies=[Depends(check_api_key)])
 def download(req: VideoRequest):
+    if youtube_service.classify_url(req.video_url) == "youtube":
+        # The cached file is already an mp4 with sound; copying 300 MB again would only cost time.
+        return FileResponse(youtube_service.cached_video(req.video_url),
+                            media_type="video/mp4", filename="video.mp4")
     workdir = tempfile.mkdtemp(prefix="dl_")
     try:
         direct = fetch_video_with_audio(req.video_url, workdir)
