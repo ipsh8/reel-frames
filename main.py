@@ -1,10 +1,12 @@
 """
-Reel Toolkit v3.3.0 — pure media extraction. No AI, no transcription, no analysis.
+Reel Toolkit v3.4.0 — media extraction and edit measurement. No AI, no transcription.
 
 Endpoints (POST, require X-API-Key header):
   /frames    -> screenshots at intervals (JSON base64 or zip)
   /audio     -> the reel's audio track as an .mp3 file
   /download  -> the reel video itself as an .mp4 file
+  /analyze   -> evidence pack for reverse-engineering the edit: cuts, camera
+                moves, audio onsets, contact sheets, transition strips (zip)
   /health    -> liveness check (GET, no auth)
 
 /audio downloads Instagram's audio-only stream. /download takes the pre-muxed MP4
@@ -19,6 +21,7 @@ Env vars:
                    withhold a reel's audio from this server.
   IG_COOKIES_FILE  optional path to a Netscape cookies.txt; used instead of
                    IG_COOKIES when both are set
+  ANALYZE_MAX_SECONDS  longest video /analyze accepts (default 180)
   YTDLP_PROXY      optional proxy for /audio and /download
                    (http://user:pass@host:port). Instagram serves this server
                    muted copies of some reels; through a residential proxy it
@@ -43,8 +46,9 @@ from pydantic import BaseModel, Field
 from starlette.background import BackgroundTask
 from mask_service import router as mask_router
 from audio_service import router as audio_router
+from analyze_service import router as analyze_router
 
-app = FastAPI(title="Reel Toolkit", version="3.3.0")
+app = FastAPI(title="Reel Toolkit", version="3.4.0")
 
 app.include_router(mask_router)
 app.include_router(audio_router)
@@ -61,6 +65,9 @@ def check_api_key(x_api_key: str = Header(None)):
         raise HTTPException(500, "Server misconfigured: API_KEY env var not set")
     if x_api_key != expected:
         raise HTTPException(401, "Invalid or missing X-API-Key header")
+
+
+app.include_router(analyze_router, dependencies=[Depends(check_api_key)])
 
 
 class FrameRequest(BaseModel):

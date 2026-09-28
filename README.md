@@ -1,7 +1,9 @@
 # Reel Toolkit (reel-frames)
 
 Send an Instagram reel link (or a direct video URL) and get back frames, the
-audio track, or the video file. FastAPI + ffmpeg + yt-dlp, no AI. The n8n
+audio track, the video file, or an **evidence pack** that measures how the reel
+was edited (cuts, transitions, camera moves, beats). FastAPI + ffmpeg + yt-dlp
++ OpenCV, no AI. The n8n
 reel workflows (e.g. **REEL INTELLI A**) call it on Railway at
 `https://reel-frames-production.up.railway.app`.
 
@@ -44,6 +46,7 @@ Every `POST` needs the `X-API-Key` header set to the `API_KEY` env var.
 | `POST /audio` | `{"video_url": "..."}` | the reel's sound as `audio.mp3` (mono, 64 kbps) |
 | `POST /download` | `{"video_url": "..."}` | the reel as `reel.mp4`, with its sound |
 | `POST /audio-duration` | `{"audio_b64": "..."}` | `{"duration": <seconds>}` via ffprobe |
+| `POST /analyze` | `{"video_url": "..."}` | the evidence pack as `analysis.zip` (see [Reel analysis](#reel-analysis-evidence-pack)) |
 | `GET /health` | — | `{"status": "ok", "version": ...}`, no key needed |
 
 `/frames` body:
@@ -92,6 +95,51 @@ curl -X POST http://localhost:8000/frames \
   -d '{"video_url":"https://instagram.com/reel/ABC123/","interval":3,"output":"json","width":480}'
 ```
 
+## Reel analysis (evidence pack)
+
+`analysis/` measures a reel's edit so an AI (the `reel-reverse-engineer`
+skill) only has to *name* what was measured, not hunt for it frame by frame.
+Same code, two ways in:
+
+```bash
+.venv/bin/python -m analysis https://www.instagram.com/reel/ABC123/ -o pack/   # or a local .mp4
+curl -X POST http://localhost:8000/analyze -H "X-API-Key: dev" \
+  -H "Content-Type: application/json" -d '{"video_url":"https://www.instagram.com/reel/ABC123/"}' -o analysis.zip
+```
+
+What's in the pack:
+
+| File | What it is |
+|---|---|
+| `summary.md` | The compact view: shot table (cut type, source fps, camera moves with easing), overlay changes, audio, image list with token costs. **This is what the AI reads.** |
+| `timeline.json` | Everything, including per-frame arrays (`diff, luma, sharp, dx, dy, zoom, rot, resid, comp, spread`) |
+| `sheets/` | The reel at 2 fps, 32 labelled tiles per sheet |
+| `strips/` | Every frame around each cut, each hidden whip inside a shot, and each unsure overlay change; the transition frames are outlined |
+| `motion.png` | All signals on one timeline, cuts coloured by type, audio onsets as ticks |
+
+How it measures, in one pass at 180 px wide:
+
+- **Camera motion**: textured corners are tracked (Lucas–Kanade) and a
+  similarity transform is RANSAC-fitted per frame → pan, tilt, zoom, roll.
+  Dense optical flow was tried first and rejected: flat areas (solid
+  backgrounds, sky) report zero motion and outvote the moving parts.
+- **Cuts**: the previous frame is warped by that camera move before comparing,
+  so a crash zoom inside a shot doesn't hide (or fake) a cut. Each edit is
+  typed `hard`, `flash`, `dip`, `whip`, `dissolve` (frames that really are a
+  blend of before/after), or `graphic` (only part of the frame changed: a
+  caption or sticker swap, kept because it times the captions).
+- **Camera moves**: each shot is split into push-in / pull-out / pan / tilt /
+  roll / whip / static runs with `ease-in`, `ease-out`, `ease-in-out` or `linear`.
+- **Source frame rate**: single repeated frames reveal the rate a shot was
+  made at. AI video is usually 24 fps and shows up as 24 on a 30 fps timeline.
+- **Audio**: spectral-flux onsets, a tempo estimate, and each cut's offset to
+  the nearest onset, next to the share of cuts that would land "on beat" by
+  chance (voiceover is dense, so the raw ratio alone misleads).
+
+Known limits: in flat UI/motion-graphics sections, the "camera" can be UI
+elements moving; the strips settle it. Borderline cut-vs-overlay calls are
+marked `(unsure)`. A 32 s reel takes about 15 s on a laptop.
+
 ## How Instagram media is fetched
 
 Instagram offers each reel in two forms: separate DASH streams (video-only and
@@ -123,6 +171,7 @@ See `.env.example`.
 | `FFMPEG_TIMEOUT` | 180 | seconds per ffmpeg/ffprobe run |
 | `YTDLP_TIMEOUT` | 60 | seconds for yt-dlp to resolve a URL (`/frames`) |
 | `HARD_MAX_FRAMES` | 300 | server-side cap on `max_frames` |
+| `ANALYZE_MAX_SECONDS` | 180 | `/analyze` refuses longer videos (422) |
 
 ### Getting `IG_COOKIES`
 

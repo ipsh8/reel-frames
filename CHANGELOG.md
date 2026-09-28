@@ -3,6 +3,24 @@
 All notable changes to this project. Format follows
 [Keep a Changelog](https://keepachangelog.com); dates are ISO 8601.
 
+## [3.4.0] - 2026-09-28
+
+### Added
+- Reel analysis: `python -m analysis` and `POST /analyze` build an evidence
+  pack for reverse-engineering a reel's edit — typed cuts (hard, flash, dip,
+  whip, dissolve, caption/overlay changes), camera moves with easing, each
+  shot's source frame rate, audio onsets and cut timing, plus contact sheets,
+  every-frame transition strips and a motion graph sized to be cheap for an AI
+  to read (~11k image tokens for a 32 s reel instead of ~1.5M for every frame).
+  Feature doc: `docs/features/2026-09-28-reel-analysis-pack.md`.
+  ([fb3b6a4](https://github.com/ipsh8/reel-frames/commit/fb3b6a4),
+  [a209707](https://github.com/ipsh8/reel-frames/commit/a209707),
+  [6e5c54e](https://github.com/ipsh8/reel-frames/commit/6e5c54e),
+  [7d54f35](https://github.com/ipsh8/reel-frames/commit/7d54f35),
+  [3898e57](https://github.com/ipsh8/reel-frames/commit/3898e57))
+- `ANALYZE_MAX_SECONDS` (default 180).
+- Dependency: `opencv-python-headless`.
+
 ## [3.3.0] - 2026-09-19
 
 ### Added
