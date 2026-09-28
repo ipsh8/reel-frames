@@ -25,7 +25,7 @@ def still(workdir, name=None, size="720x1280", source="testsrc2"):
 
 def static(workdir, name="static.mp4", seconds=2, src=None):
     out = os.path.join(workdir, name)
-    ffmpeg("-loop", "1", "-i", src or still(workdir), "-t", str(seconds), "-r", str(FPS),
+    ffmpeg("-framerate", str(FPS), "-loop", "1", "-i", src or still(workdir), "-t", str(seconds), "-r", str(FPS),
            "-vf", f"scale={W}:{H}", "-pix_fmt", "yuv420p", out)
     return out
 
@@ -33,7 +33,7 @@ def static(workdir, name="static.mp4", seconds=2, src=None):
 def pan_right(workdir, name="pan.mp4", seconds=2, px_per_sec=90):
     """Camera slides right over the pattern: content moves left."""
     out = os.path.join(workdir, name)
-    ffmpeg("-loop", "1", "-i", still(workdir, size="1440x1280"), "-t", str(seconds), "-r", str(FPS),
+    ffmpeg("-framerate", str(FPS), "-loop", "1", "-i", still(workdir, size="1440x1280"), "-t", str(seconds), "-r", str(FPS),
            "-vf", f"crop=720:1280:x='t*{px_per_sec * 2}':y=0,scale={W}:{H}", "-pix_fmt", "yuv420p", out)
     return out
 
@@ -42,9 +42,27 @@ def push_in(workdir, name="zoom.mp4", seconds=2):
     """Camera pushes in toward the centre: content expands outward."""
     out = os.path.join(workdir, name)
     frames = seconds * FPS
-    ffmpeg("-loop", "1", "-i", still(workdir), "-frames:v", str(frames), "-r", str(FPS),
+    ffmpeg("-framerate", str(FPS), "-loop", "1", "-i", still(workdir), "-frames:v", str(frames), "-r", str(FPS),
            "-vf", "scale=w='trunc(720*(1+0.006*n)/2)*2':h=-2:eval=frame,crop=720:1280,"
                   f"scale={W}:{H}", "-pix_fmt", "yuv420p", out)
+    return out
+
+
+def hold_then_pan(workdir, name="holdpan.mp4"):
+    """1 s locked-off, then the camera pans right for 1 s."""
+    out = os.path.join(workdir, name)
+    ffmpeg("-framerate", str(FPS), "-loop", "1", "-i", still(workdir, size="1440x1280"), "-t", "2", "-r", str(FPS),
+           "-vf", f"crop=720:1280:x='max(0,t-1)*240':y=0,scale={W}:{H}", "-pix_fmt", "yuv420p", out)
+    return out
+
+
+def pan_24_in_30(workdir, name="pan2430.mp4"):
+    """A pan rendered at 24 fps, then conformed to 30 fps by repeating frames (like AI video clips)."""
+    src = os.path.join(workdir, "pan24.mp4")
+    ffmpeg("-framerate", str(FPS), "-loop", "1", "-i", still(workdir, size="1440x1280"), "-t", "2", "-r", "24",
+           "-vf", f"crop=720:1280:x='t*180':y=0,scale={W}:{H}", "-pix_fmt", "yuv420p", src)
+    out = os.path.join(workdir, name)
+    ffmpeg("-i", src, "-vf", "fps=30", "-pix_fmt", "yuv420p", out)
     return out
 
 
@@ -93,7 +111,7 @@ def dissolve(workdir):
 def caption_pop(workdir):
     """One static shot; at 1.0 s a white caption block appears in the lower third."""
     out = os.path.join(workdir, "caption.mp4")
-    ffmpeg("-loop", "1", "-i", still(workdir), "-t", "2", "-r", str(FPS),
+    ffmpeg("-framerate", str(FPS), "-loop", "1", "-i", still(workdir), "-t", "2", "-r", str(FPS),
            "-vf", f"scale={W}:{H},drawbox=enable='gte(t,1)':x=60:y=420:w=240:h=70:color=white:t=fill",
            "-pix_fmt", "yuv420p", out)
     return out
