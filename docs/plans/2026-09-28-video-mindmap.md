@@ -1135,960 +1135,130 @@ return out;
 - [ ] **Step 9:** Tell the user to send the YouTube link to the Telegram bot
   and confirm the "Ready for breakdown" message arrives.
 
-### Task 10: Skill scripts (tests first)
-
-Skill directory: `SKILL="$HOME/.skillbook/skills/video-mindmap"`. The
-scripts are stdlib-only, except `frames_at.py` (Pillow) and `transcribe.py`
-(faster-whisper), which use PEP 723 headers so `uv run` supplies their
-dependencies. Tests run with
-`python3 -m unittest discover -s "$SKILL/tests"`.
-
-- [ ] **Step 1: `tests/test_mapfile.py`**
-
-```python
-import os
-import sys
-import unittest
-
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "scripts"))
-
-import mapfile  # noqa: E402
-
-
-def sample():
-    return {"video": {"id": "reFzEtCG_m8", "title": "A film"}, "whimsical": {}, "atlas": {},
-            "nodes": [
-                {"code": "0", "parent": None, "title": "A film", "source": "video", "times": []},
-                {"code": "1", "parent": "0", "title": "Story", "source": "video", "times": [143]},
-                {"code": "1.1", "parent": "1", "title": "Storyboards", "source": "video", "times": [180]},
-                {"code": "2", "parent": "0", "title": "Characters", "source": "video", "times": [303]},
-            ]}
-
-
-class Validate(unittest.TestCase):
-    def test_clean_map(self):
-        self.assertEqual(mapfile.validate(sample()), [])
-
-    def test_catches_each_rule(self):
-        m = sample()
-        m["nodes"] += [
-            {"code": "1.1", "parent": "1", "title": "dup", "source": "video", "times": [1]},
-            {"code": "3.1", "parent": "3", "title": "orphan", "source": "video", "times": [1]},
-            {"code": "2.1", "parent": "2", "title": "q", "source": "video", "times": [1],
-             "quote": " ".join(["word"] * 16)},
-            {"code": "2.2", "parent": "2", "title": "r", "source": "research"},
-            {"code": "2.3", "parent": "2", "title": "t", "source": "video"},
-        ]
-        errors = "\n".join(mapfile.validate(m))
-        for needle in ("1.1: duplicate", "3.1: parent 3 is missing", "2.1: quote",
-                       "2.2: research node has no source link", "2.3: video node has no timestamp"):
-            self.assertIn(needle, errors)
-
-
-class Codes(unittest.TestCase):
-    def test_next_code(self):
-        self.assertEqual(mapfile.next_code(sample(), "0"), "3")
-        self.assertEqual(mapfile.next_code(sample(), "1"), "1.2")
-        self.assertEqual(mapfile.next_code(sample(), "2"), "2.1")
-
-    def test_add_child_keeps_codes_stable(self):
-        m = sample()
-        node = mapfile.add_child(m, "1", "Shot list", source="research", refs=["https://example.com"])
-        self.assertEqual((node["code"], node["parent"]), ("1.2", "1"))
-        self.assertEqual(mapfile.validate(m), [])
-
-
-class Reconcile(unittest.TestCase):
-    OUTLINE = ("- A film\n"
-               "  - 1 Story beats · ▶ 2:23\n"
-               "    - 1.1 Storyboards · [▶ 3:00](https://youtu.be/x)\n"
-               "    - Thumbnail sketches\n"
-               "  - 2 Characters\n")
-
-    def test_rename_and_new_user_node(self):
-        m = sample()
-        changes = mapfile.reconcile(m, mapfile.parse_outline(self.OUTLINE))
-        by = {n["code"]: n for n in m["nodes"]}
-        self.assertEqual(by["1"]["title"], "Story beats")
-        self.assertEqual((by["1.2"]["title"], by["1.2"]["source"]), ("Thumbnail sketches", "user"))
-        self.assertTrue(any("1.2" in c for c in changes))
-
-    def test_missing_nodes_are_reported_not_deleted(self):
-        m = sample()
-        changes = mapfile.reconcile(m, mapfile.parse_outline("- A film\n  - 1 Story\n"))
-        self.assertIn("2", {n["code"] for n in m["nodes"]})
-        self.assertTrue(any(c.startswith("2:") and "not in Whimsical" in c for c in changes))
-
-
-if __name__ == "__main__":
-    unittest.main()
-```
-
-- [ ] **Step 2: `scripts/mapfile.py`**
-
-```python
-#!/usr/bin/env python3
-"""map.json, the single source of truth for one video's mind map.
-
-  python3 mapfile.py validate MAP
-  python3 mapfile.py next-code MAP PARENT
-  python3 mapfile.py add MAP --parent 3.2 --title T [--summary S] [--source research]
-                         [--time 982] [--quote Q] [--ref URL]
-  python3 mapfile.py reconcile MAP OUTLINE_FILE     # pull hand edits made in Whimsical
-  python3 mapfile.py set MAP whimsical.url VALUE     # whimsical.file_id, atlas.url, ...
-"""
-import argparse
-import json
-import re
-import sys
-
-SOURCES = {"video", "research", "user"}
-MAX_QUOTE_WORDS = 15   # quotes stay short; the breakdown paraphrases the rest
-MAX_FRAMES = 2         # the atlas publish is capped at 255 files
-CODE = re.compile(r"^(0|[1-9]\d*(\.[1-9]\d*)*)$")
-BULLET = re.compile(r"^(?P<indent>\s*)[-*]\s+(?P<text>.+?)\s*$")
-LABEL = re.compile(r"^(?:🔍\s*)?(?P<code>[1-9]\d*(?:\.[1-9]\d*)*)\s+(?P<title>.+)$")
-
-
-def code_key(code: str) -> tuple:
-    return tuple(int(p) for p in code.split("."))
-
-
-def parent_of(code: str):
-    if code == "0":
-        return None
-    return code.rsplit(".", 1)[0] if "." in code else "0"
-
-
-def load(path):
-    with open(path) as f:
-        return json.load(f)
-
-
-def save(m, path):
-    m["nodes"].sort(key=lambda n: code_key(n["code"]))
-    with open(path, "w") as f:
-        json.dump(m, f, indent=2, ensure_ascii=False)
-        f.write("\n")
-
-
-def validate(m) -> list[str]:
-    errors, seen = [], set()
-    for n in m["nodes"]:
-        c = n.get("code", "")
-        if not CODE.match(c):
-            errors.append(f"{c!r}: not a valid code")
-            continue
-        if c in seen:
-            errors.append(f"{c}: duplicate code")
-        seen.add(c)
-        if n.get("parent") != parent_of(c):
-            errors.append(f"{c}: parent should be {parent_of(c)}, is {n.get('parent')}")
-        if n.get("source") not in SOURCES:
-            errors.append(f"{c}: source must be one of {sorted(SOURCES)}")
-        if not n.get("title"):
-            errors.append(f"{c}: no title")
-        if len((n.get("quote") or "").split()) > MAX_QUOTE_WORDS:
-            errors.append(f"{c}: quote is over {MAX_QUOTE_WORDS} words")
-        if n.get("source") == "video" and c != "0" and not n.get("times"):
-            errors.append(f"{c}: video node has no timestamp")
-        if n.get("source") == "research" and not n.get("refs"):
-            errors.append(f"{c}: research node has no source link")
-        if len(n.get("frames") or []) > MAX_FRAMES:
-            errors.append(f"{c}: more than {MAX_FRAMES} frames")
-    for c in sorted(seen - {"0"}, key=code_key):
-        if parent_of(c) not in seen:
-            errors.append(f"{c}: parent {parent_of(c)} is missing")
-    if "0" not in seen:
-        errors.append("root node 0 is missing")
-    return errors
-
-
-def next_code(m, parent: str) -> str:
-    taken = [code_key(n["code"])[-1] for n in m["nodes"] if n.get("parent") == parent]
-    number = max(taken, default=0) + 1
-    return str(number) if parent == "0" else f"{parent}.{number}"
-
-
-def add_child(m, parent, title, summary="", source="video", times=(), quote="", refs=()):
-    if parent not in {n["code"] for n in m["nodes"]}:
-        raise ValueError(f"no node {parent}")
-    node = {"code": next_code(m, parent), "parent": parent, "title": title, "summary": summary,
-            "source": source, "times": list(times), "quote": quote, "frames": [], "refs": list(refs)}
-    m["nodes"].append(node)
-    return node
-
-
-def _strip_time(text: str) -> str:
-    for marker in (" · [▶", " · ▶"):
-        text = text.split(marker)[0]
-    return text.strip()
-
-
-def parse_outline(text: str) -> list[dict]:
-    """Indented bullets (to_outline.py's format) → [{depth, code, title}]; code is None for new nodes."""
-    items = []
-    for line in text.splitlines():
-        b = BULLET.match(line)
-        if not b:
-            continue
-        depth = len(b["indent"].expandtabs(2)) // 2
-        label = _strip_time(b["text"])
-        lab = LABEL.match(label)
-        items.append({"depth": depth, "code": lab["code"] if lab else None,
-                      "title": (lab["title"] if lab else label.removeprefix("🔍").strip()).strip()})
-    return items
-
-
-def reconcile(m, items) -> list[str]:
-    """Bring hand edits from Whimsical into map.json. Renames and new nodes apply; deletions are only reported."""
-    by_code = {n["code"]: n for n in m["nodes"]}
-    changes, stack, present = [], [], {"0"}
-    for it in items:
-        while stack and stack[-1][0] >= it["depth"]:
-            stack.pop()
-        if not stack and it["depth"] == 0 and it["code"] is None:
-            stack.append((0, "0"))  # the root node carries the video title, not a code
-            continue
-        parent = stack[-1][1] if stack else "0"
-        node = by_code.get(it["code"]) if it["code"] else None
-        if node:
-            if node["title"] != it["title"]:
-                changes.append(f"{node['code']}: renamed '{node['title']}' → '{it['title']}'")
-                node["title"] = it["title"]
-        else:
-            node = add_child(m, parent, it["title"], source="user")
-            by_code[node["code"]] = node
-            changes.append(f"{node['code']}: new node from Whimsical '{it['title']}' under {parent}")
-        present.add(node["code"])
-        stack.append((it["depth"], node["code"]))
-    for code in sorted(set(by_code) - present, key=code_key):
-        changes.append(f"{code}: not in Whimsical any more (kept in map.json; delete by hand if intended)")
-    return changes
-
-
-def _set(m, dotted, value):
-    head, key = dotted.split(".", 1)
-    m.setdefault(head, {})[key] = value
-
-
-def main(argv=None):
-    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    sub = ap.add_subparsers(dest="cmd", required=True)
-    sub.add_parser("validate").add_argument("map")
-    nc = sub.add_parser("next-code")
-    nc.add_argument("map")
-    nc.add_argument("parent")
-    add = sub.add_parser("add")
-    add.add_argument("map")
-    for flag in ("--parent", "--title"):
-        add.add_argument(flag, required=True)
-    add.add_argument("--summary", default="")
-    add.add_argument("--source", default="video", choices=sorted(SOURCES))
-    add.add_argument("--time", type=int, action="append", default=[])
-    add.add_argument("--quote", default="")
-    add.add_argument("--ref", action="append", default=[])
-    rc = sub.add_parser("reconcile")
-    rc.add_argument("map")
-    rc.add_argument("outline")
-    st = sub.add_parser("set")
-    st.add_argument("map")
-    st.add_argument("key")
-    st.add_argument("value")
-    a = ap.parse_args(argv)
-
-    m = load(a.map)
-    if a.cmd == "validate":
-        errors = validate(m)
-        print("\n".join(errors) or f"ok: {len(m['nodes'])} nodes")
-        return 1 if errors else 0
-    if a.cmd == "next-code":
-        print(next_code(m, a.parent))
-        return 0
-    if a.cmd == "add":
-        node = add_child(m, a.parent, a.title, a.summary, a.source, a.time, a.quote, a.ref)
-        print(node["code"])
-    elif a.cmd == "reconcile":
-        with open(a.outline) as f:
-            print("\n".join(reconcile(m, parse_outline(f.read()))) or "no changes")
-    elif a.cmd == "set":
-        _set(m, a.key, a.value)
-    save(m, a.map)
-    return 0
-
-
-if __name__ == "__main__":
-    sys.exit(main())
-```
-
-- [ ] **Step 3: `tests/test_to_outline.py`**
-
-```python
-import os
-import sys
-import unittest
-
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "scripts"))
-
-import mapfile  # noqa: E402
-from to_outline import outline, timestamp  # noqa: E402
-from test_mapfile import sample  # noqa: E402
-
-
-class Outline(unittest.TestCase):
-    def test_nesting_codes_and_links(self):
-        text = outline(sample())
-        self.assertEqual(text.splitlines(), [
-            "- A film",
-            "  - 1 Story · [▶ 2:23](https://www.youtube.com/watch?v=reFzEtCG_m8&t=143s)",
-            "    - 1.1 Storyboards · [▶ 3:00](https://www.youtube.com/watch?v=reFzEtCG_m8&t=180s)",
-            "  - 2 Characters · [▶ 5:03](https://www.youtube.com/watch?v=reFzEtCG_m8&t=303s)",
-        ])
-
-    def test_plain_links_and_research_marker(self):
-        m = sample()
-        mapfile.add_child(m, "2", "Turnaround sheets", source="research", refs=["https://example.com"])
-        text = outline(m, links="plain")
-        self.assertIn("  - 1 Story · ▶ 2:23", text)
-        self.assertIn("    - 🔍 2.1 Turnaround sheets", text)
-
-    def test_subtree(self):
-        self.assertEqual(outline(sample(), root="1", links="plain").splitlines(),
-                         ["- 1 Story · ▶ 2:23", "  - 1.1 Storyboards · ▶ 3:00"])
-
-    def test_round_trip_through_reconcile_changes_nothing(self):
-        m = sample()
-        self.assertEqual(mapfile.reconcile(m, mapfile.parse_outline(outline(m))), [])
-
-    def test_timestamp(self):
-        self.assertEqual((timestamp(59), timestamp(982), timestamp(3725)), ("0:59", "16:22", "1:02:05"))
-
-
-if __name__ == "__main__":
-    unittest.main()
-```
-
-- [ ] **Step 4: `scripts/to_outline.py`**
-
-```python
-#!/usr/bin/env python3
-"""map.json → indented bullet outline for Whimsical's mind map (create, or edit of one branch).
-
-  python3 to_outline.py MAP [--links markdown|plain] [--root CODE]
-
-▶ mm:ss marks a node taken from the video (linked to that second); 🔍 marks added research.
-"""
-import argparse
-import os
-import sys
-from collections import defaultdict
-
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from mapfile import code_key, load  # noqa: E402
-
-
-def timestamp(seconds) -> str:
-    s = int(seconds)
-    h, rest = divmod(s, 3600)
-    m, s = divmod(rest, 60)
-    return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
-
-
-def watch_link(video_id: str, seconds) -> str:
-    return f"https://www.youtube.com/watch?v={video_id}&t={int(seconds)}s"
-
-
-def label(node, video_id, links) -> str:
-    if node["code"] == "0":
-        return node["title"]
-    text = ("🔍 " if node.get("source") == "research" else "") + f"{node['code']} {node['title']}"
-    if node.get("times"):
-        t = node["times"][0]
-        text += (f" · [▶ {timestamp(t)}]({watch_link(video_id, t)})" if links == "markdown"
-                 else f" · ▶ {timestamp(t)}")
-    return text
-
-
-def outline(m, links="markdown", root="0") -> str:
-    children = defaultdict(list)
-    by_code = {}
-    for n in m["nodes"]:
-        by_code[n["code"]] = n
-        children[n.get("parent")].append(n)
-    lines = []
-
-    def walk(node, depth):
-        lines.append("  " * depth + "- " + label(node, m["video"]["id"], links))
-        for child in sorted(children[node["code"]], key=lambda n: code_key(n["code"])):
-            walk(child, depth + 1)
-
-    walk(by_code[root], 0)
-    return "\n".join(lines) + "\n"
-
-
-if __name__ == "__main__":
-    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("map")
-    ap.add_argument("--links", choices=("markdown", "plain"), default="markdown")
-    ap.add_argument("--root", default="0")
-    a = ap.parse_args()
-    sys.stdout.write(outline(load(a.map), a.links, a.root))
-```
-
-- [ ] **Step 5: `tests/test_transcript_md.py`** (made-up caption text only)
-
-```python
-import os
-import sys
-import unittest
-
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "scripts"))
-
-from transcript_md import paragraphs, parse_vtt, render  # noqa: E402
-
-AUTO = """WEBVTT
-Kind: captions
-Language: en
-
-00:00:00.000 --> 00:00:02.000 align:start position:0%
- 
-hello<00:00:00.500><c> and</c><00:00:01.000><c> welcome</c>
-
-00:00:02.000 --> 00:00:02.010 align:start position:0%
-hello and welcome
- 
-
-00:00:02.010 --> 00:00:04.000 align:start position:0%
-hello and welcome
-today<00:00:02.500><c> we</c><c> build</c> &amp; test
-
-00:01:40.000 --> 00:01:42.000
-next chapter starts
-"""
-
-INFO = {"title": "A film", "channel": "Chan", "webpage_url": "https://youtu.be/x", "duration": 200,
-        "chapters": [{"start": 0, "end": 98, "title": "Welcome"}, {"start": 98, "end": 200, "title": "Story"}]}
-
-
-class Vtt(unittest.TestCase):
-    def test_rolling_auto_captions_keep_each_line_once(self):
-        self.assertEqual(parse_vtt(AUTO), [(0.0, "hello and welcome"), (2.01, "today we build & test"),
-                                           (100.0, "next chapter starts")])
-
-    def test_paragraphs_break_at_chapters(self):
-        paras = paragraphs(parse_vtt(AUTO), INFO["chapters"], every=20)
-        self.assertEqual([(ch, round(t)) for ch, t, _ in paras], [(0, 0), (1, 100)])
-
-    def test_render(self):
-        md = render(parse_vtt(AUTO), INFO)
-        self.assertIn("## 0:00 Welcome", md)
-        self.assertIn("## 1:38 Story", md)
-        self.assertIn("[1:40] next chapter starts", md)
-
-    def test_no_chapters_gives_one_section(self):
-        md = render(parse_vtt(AUTO), {**INFO, "chapters": []})
-        self.assertIn("## 0:00 Full video", md)
-
-
-if __name__ == "__main__":
-    unittest.main()
-```
-
-- [ ] **Step 6: `scripts/transcript_md.py`**
-
-```python
-#!/usr/bin/env python3
-"""transcript.vtt (+ info.json chapters) → transcript.md: short timestamped paragraphs under chapter headings.
-
-  python3 transcript_md.py TRANSCRIPT.vtt INFO.json > transcript.md
-
-YouTube's auto captions repeat every line while it scrolls; each line is kept once.
-Reads the service's info.json and raw yt-dlp info (start_time/end_time) alike.
-"""
-import html
-import json
-import os
-import re
-import sys
-from collections import deque
-
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from to_outline import timestamp  # noqa: E402
-
-CUE = re.compile(r"^(?:(\d+):)?(\d{2}):(\d{2})\.(\d{3})\s+-->")
-TAG = re.compile(r"<[^>]*>")
-
-
-def parse_vtt(text: str) -> list[tuple[float, str]]:
-    lines, recent, start = [], deque(maxlen=3), None
-    for raw in text.splitlines():
-        cue = CUE.match(raw.strip())
-        if cue:
-            h, m, s, ms = cue.groups()
-            start = int(h or 0) * 3600 + int(m) * 60 + int(s) + int(ms) / 1000
-            continue
-        if start is None:
-            continue  # WEBVTT header block
-        line = " ".join(html.unescape(TAG.sub("", raw)).split())
-        if line and line not in recent:
-            lines.append((round(start, 3), line))
-            recent.append(line)
-    return lines
-
-
-def _chapters(info) -> list[dict]:
-    chapters = [{"start": c.get("start", c.get("start_time")) or 0, "title": c.get("title") or ""}
-                for c in info.get("chapters") or []]
-    return chapters or [{"start": 0, "title": "Full video"}]
-
-
-def paragraphs(lines, chapters, every=20) -> list[tuple[int, float, str]]:
-    """[(chapter index, start seconds, text)]; a new paragraph every ~`every` s and at each chapter."""
-    starts = [c["start"] for c in chapters]
-    out = []
-    for t, text in lines:
-        ch = max((i for i, s in enumerate(starts) if s <= t), default=0)
-        if out and out[-1][0] == ch and t - out[-1][1] < every:
-            out[-1] = (ch, out[-1][1], out[-1][2] + " " + text)
-        else:
-            out.append((ch, t, text))
-    return out
-
-
-def render(lines, info, every=20) -> str:
-    chapters = _chapters(info)
-    head = [f"# {info.get('title', '')}", "",
-            f"{info.get('channel', '')} · {info.get('webpage_url', '')} · {timestamp(info.get('duration') or 0)}"]
-    body, current = [], None
-    for ch, t, text in paragraphs(lines, chapters, every):
-        if ch != current:
-            body += ["", f"## {timestamp(chapters[ch]['start'])} {chapters[ch]['title']}", ""]
-            current = ch
-        body.append(f"[{timestamp(t)}] {text}")
-    return "\n".join(head + body) + "\n"
-
-
-if __name__ == "__main__":
-    with open(sys.argv[1]) as f:
-        vtt = f.read()
-    with open(sys.argv[2]) as f:
-        info = json.load(f)
-    sys.stdout.write(render(parse_vtt(vtt), info))
-```
-
-- [ ] **Step 7: `tests/test_render_atlas.py`**
-
-```python
-import json
-import os
-import sys
-import tempfile
-import unittest
-
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "scripts"))
-
-from render_atlas import render  # noqa: E402
-from test_mapfile import sample  # noqa: E402
-
-
-class Atlas(unittest.TestCase):
-    def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory()
-        self.frames = os.path.join(self.tmp.name, "candidates")
-        os.makedirs(self.frames)
-        open(os.path.join(self.frames, "1_143_b.jpg"), "wb").write(b"jpg")
-        self.out = os.path.join(self.tmp.name, "atlas")
-
-    def tearDown(self):
-        self.tmp.cleanup()
-
-    def payload(self):
-        page = open(os.path.join(self.out, "index.html")).read()
-        start = page.index('<script type="application/json" id="data">') + len(
-            '<script type="application/json" id="data">')
-        return page, json.loads(page[start:page.index("</script>", start)])
-
-    def test_one_card_per_node_and_frames_copied(self):
-        m = sample()
-        m["nodes"][1]["frames"] = ["1_143_b.jpg"]
-        stats = render(m, self.frames, self.out)
-        _, data = self.payload()
-        self.assertEqual([n["code"] for n in data["nodes"]], ["0", "1", "1.1", "2"])
-        self.assertEqual(data["nodes"][1]["frames"], ["frames/1_143_b.jpg"])
-        self.assertEqual(data["nodes"][1]["times"][0]["label"], "2:23")
-        self.assertTrue(os.path.exists(os.path.join(self.out, "frames", "1_143_b.jpg")))
-        self.assertEqual(stats["frames"], 1)
-
-    def test_missing_frame_is_reported(self):
-        m = sample()
-        m["nodes"][2]["frames"] = ["nope.jpg"]
-        self.assertEqual(render(m, self.frames, self.out)["missing"], ["1.1: nope.jpg"])
-
-    def test_script_close_tag_in_text_cannot_break_the_page(self):
-        m = sample()
-        m["nodes"][1]["title"] = "</script><b>x"
-        render(m, self.frames, self.out)
-        page, data = self.payload()
-        self.assertEqual(data["nodes"][1]["title"], "</script><b>x")
-
-    def test_too_many_frames_refuses(self):
-        m = sample()
-        for i in range(126):
-            name = f"f{i}.jpg"
-            open(os.path.join(self.frames, name), "wb").write(b"j")
-            m["nodes"].append({"code": f"2.{i + 1}", "parent": "2", "title": "t", "source": "video",
-                               "times": [1], "frames": [name, name.replace(".jpg", "b.jpg")]})
-            open(os.path.join(self.frames, name.replace(".jpg", "b.jpg")), "wb").write(b"j")
-        with self.assertRaises(SystemExit):
-            render(m, self.frames, self.out)
-
-
-if __name__ == "__main__":
-    unittest.main()
-```
-
-- [ ] **Step 8: `scripts/render_atlas.py`**
-
-```python
-#!/usr/bin/env python3
-"""map.json + chosen frames → atlas/index.html and atlas/frames/, ready to publish as an Artifact.
-
-  python3 render_atlas.py MAP CANDIDATES_DIR OUT_DIR
-
-Publish OUT_DIR/index.html with every frames/<name> passed in the Artifact `files` map.
-"""
-import json
-import os
-import shutil
-import sys
-
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from mapfile import code_key, load  # noqa: E402
-from to_outline import timestamp, watch_link  # noqa: E402
-
-MAX_FILES = 250  # an Artifact publish takes at most 255 files, the page included
-TEMPLATE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "atlas_template.html")
-
-
-def _node_payload(n, video_id, frame_paths):
-    return {"code": n["code"], "parent": n.get("parent"), "title": n["title"],
-            "summary": n.get("summary", ""), "source": n.get("source", "video"), "quote": n.get("quote", ""),
-            "times": [{"label": timestamp(t), "url": watch_link(video_id, t)} for t in n.get("times") or []],
-            "frames": frame_paths, "refs": n.get("refs") or []}
-
-
-def render(m, candidates_dir, out_dir) -> dict:
-    frames_out = os.path.join(out_dir, "frames")
-    shutil.rmtree(out_dir, ignore_errors=True)
-    os.makedirs(frames_out)
-    wanted = sorted({f for n in m["nodes"] for f in n.get("frames") or []})
-    if len(wanted) > MAX_FILES:
-        sys.exit(f"{len(wanted)} frames; an atlas can publish at most {MAX_FILES}. Trim frames in map.json.")
-    missing, nodes = [], []
-    for n in sorted(m["nodes"], key=lambda n: code_key(n["code"])):
-        paths = []
-        for name in n.get("frames") or []:
-            src = os.path.join(candidates_dir, name)
-            if os.path.exists(src):
-                shutil.copy2(src, os.path.join(frames_out, name))
-                paths.append(f"frames/{name}")
-            else:
-                missing.append(f"{n['code']}: {name}")
-        nodes.append(_node_payload(n, m["video"]["id"], paths))
-    data = {"video": m["video"], "whimsical_url": (m.get("whimsical") or {}).get("url"), "nodes": nodes}
-    # "</" inside a JSON string would end the <script> element early.
-    blob = json.dumps(data, ensure_ascii=False).replace("</", "<\\/")
-    with open(TEMPLATE) as f:
-        page = f.read().replace("/*ATLAS_DATA*/", blob)
-    with open(os.path.join(out_dir, "index.html"), "w") as f:
-        f.write(page)
-    return {"nodes": len(nodes), "frames": sum(len(n["frames"]) for n in nodes), "missing": missing}
-
-
-if __name__ == "__main__":
-    stats = render(load(sys.argv[1]), sys.argv[2], sys.argv[3])
-    print(json.dumps(stats, indent=2))
-```
-
-- [ ] **Step 9: `scripts/atlas_template.html`.** Load the `artifact-design`
-  skill first and follow its page contract. The page must include:
-  - `<title>Frame Atlas</title>`
-  - colour tokens on `:root`, with dark mode under both
-    `@media (prefers-color-scheme: dark) :root:not([data-theme="light"])`
-    and `:root[data-theme="dark"]`
-  - an explicit `body` background
-  - a system font stack, with no external scripts
-  - a 16px side gutter at phone width, and no horizontal scroll
-
-  The data goes in exactly this tag:
-  `<script type="application/json" id="data">/*ATLAS_DATA*/</script>`.
-  An inline script renders it into these parts:
-  - **Header:** the video title linked to YouTube, the channel, the node
-    count, a link to the Whimsical map when there is one, and a legend
-    (`▶` from the video · `🔍` added research · `✋` added by you).
-  - **Search box:** filters cards by code, title, summary or quote.
-  - **Tree index:** nested `<details>` links to `#c-<code>` (dots become
-    dashes).
-  - **Cards, one per node,** each with id `c-<code>`:
-    - a code badge, the title and a source badge
-    - a breadcrumb of the parent chain
-    - the summary, and the quote as a `<blockquote>`
-    - timestamp chips linking to YouTube (`target=_blank`)
-    - frames as `<img loading=lazy>`; clicking one opens a `<dialog>`
-      lightbox with the code, title and timestamp
-    - research refs
-    - chips for the children
-  - **Deep links:** on load and on `hashchange`, `#3.2` or `#c-3-2`
-    scrolls to that card and highlights it.
-  - **Empty frames:** show a quiet "no frame" note.
-
-  Verify by running `render_atlas.py` on the test sample and opening it with
-  `preview_start`, url `file://…/index.html`, in the browser pane. Check it
-  at desktop width and with the `mobile` preset, in light and dark.
-- [ ] **Step 10: `scripts/frames_at.py`**
-
-```python
-# /// script
-# requires-python = ">=3.10"
-# dependencies = ["pillow>=10"]
-# ///
-"""Candidate frames around each map node's timestamps, plus labelled contact sheets to choose from.
-
-  uv run frames_at.py VIDEO MAP OUT_DIR [--spread 2] [--codes 3.2 3.3]
-
-Writes OUT_DIR/<code>_<t>_<a|b|c>.jpg (t-spread, t, t+spread for each of a node's
-first two times) and OUT_DIR/sheets/<branch>_<n>.jpg with 12 labelled tiles each.
-Pick by writing the chosen file names into the node's "frames" in map.json.
-"""
-import argparse
-import json
-import os
-import subprocess
-
-from PIL import Image, ImageDraw
-
-TILE_W, COLS, PER_SHEET = 380, 4, 12
-
-
-def grab(video, seconds, out, width=960):
-    subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-ss", f"{seconds:.2f}",
-                    "-i", video, "-frames:v", "1", "-vf", f"scale={width}:-2", "-q:v", "4", out], check=True)
-
-
-def candidates(node, spread):
-    for t in (node.get("times") or [])[:2]:
-        for k, dt in zip("abc", (-spread, 0, spread)):
-            yield f"{node['code']}_{int(t)}_{k}.jpg", max(0.0, t + dt)
-
-
-def sheet(tiles, out):
-    """tiles: [(path, label)] → one grid image with the label under each tile."""
-    thumbs = []
-    for path, text in tiles:
-        im = Image.open(path)
-        im.thumbnail((TILE_W, TILE_W))
-        thumbs.append((im, text))
-    tile_h = max(im.height for im, _ in thumbs) + 22
-    rows = (len(thumbs) + COLS - 1) // COLS
-    canvas = Image.new("RGB", (COLS * TILE_W, rows * tile_h), "white")
-    draw = ImageDraw.Draw(canvas)
-    for i, (im, text) in enumerate(thumbs):
-        x, y = (i % COLS) * TILE_W, (i // COLS) * tile_h
-        canvas.paste(im, (x, y))
-        draw.text((x + 4, y + im.height + 4), text, fill="black")
-    canvas.save(out, quality=80)
-
-
-def main():
-    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("video")
-    ap.add_argument("map")
-    ap.add_argument("out")
-    ap.add_argument("--spread", type=float, default=2.0)
-    ap.add_argument("--codes", nargs="*")
-    a = ap.parse_args()
-    with open(a.map) as f:
-        nodes = [n for n in json.load(f)["nodes"] if n.get("times") and (not a.codes or n["code"] in a.codes)]
-    os.makedirs(os.path.join(a.out, "sheets"), exist_ok=True)
-    branches = {}
-    for node in nodes:
-        for name, t in candidates(node, a.spread):
-            path = os.path.join(a.out, name)
-            if not os.path.exists(path):
-                grab(a.video, t, path)
-            branches.setdefault(node["code"].split(".")[0], []).append((path, name.removesuffix(".jpg")))
-    for branch, tiles in sorted(branches.items()):
-        for i in range(0, len(tiles), PER_SHEET):
-            sheet(tiles[i:i + PER_SHEET], os.path.join(a.out, "sheets", f"{branch}_{i // PER_SHEET + 1}.jpg"))
-    print(f"{sum(len(t) for t in branches.values())} candidates, sheets in {os.path.join(a.out, 'sheets')}")
-
-
-if __name__ == "__main__":
-    main()
-```
-
-- [ ] **Step 11: `scripts/transcribe.py`**
-
-```python
-# /// script
-# requires-python = ">=3.10,<3.13"
-# dependencies = ["faster-whisper>=1.0"]
-# ///
-"""Fallback when YouTube gives no subtitles: transcribe a video or audio file locally to WebVTT.
-
-  uv run transcribe.py MEDIA OUT.vtt [--model small.en]
-
-small.en on CPU (int8) runs at several times real time on an Apple-silicon Mac.
-"""
-import argparse
-
-from faster_whisper import WhisperModel
-
-
-def vtt_time(seconds: float) -> str:
-    ms = int(round(seconds * 1000))
-    h, ms = divmod(ms, 3_600_000)
-    m, ms = divmod(ms, 60_000)
-    s, ms = divmod(ms, 1000)
-    return f"{h:02d}:{m:02d}:{s:02d}.{ms:03d}"
-
-
-def main():
-    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("media")
-    ap.add_argument("out")
-    ap.add_argument("--model", default="small.en")
-    a = ap.parse_args()
-    model = WhisperModel(a.model, device="cpu", compute_type="int8")
-    segments, _ = model.transcribe(a.media, vad_filter=True)
-    with open(a.out, "w") as f:
-        f.write("WEBVTT\n\n")
-        for seg in segments:
-            f.write(f"{vtt_time(seg.start)} --> {vtt_time(seg.end)}\n{seg.text.strip()}\n\n")
-
-
-if __name__ == "__main__":
-    main()
-```
-
-- [ ] **Step 12:** Run `python3 -m unittest discover -s "$SKILL/tests" -v`.
-  Expected: all OK (`frames_at` and `transcribe` are checked end-to-end in
-  Task 12).
-
-### Task 11: SKILL.md and schema reference
-
-- [ ] **Step 1: `references/map-schema.md`.** It covers:
-  - every map.json field (from the spec, plus `refs`)
-  - the rules `mapfile.py validate` enforces
-  - how to shape the tree:
-    - `0` is the video
-    - level 1 is the real phases of the workflow, which can merge or split
-      the YouTube chapters
-    - level 2 is steps
-    - level 3 is techniques, tools, prompts and gotchas
-    - aim for 40–90 nodes for a 30-minute video
-  - the `workflow.md` template, one section per phase:
-    - Goal
-    - Tools
-    - Steps (numbered, each with `[mm:ss]`)
-    - Prompts/settings she used, paraphrased
-    - Problems and how she solved them
-    - Node codes covered
-  - plus a closing "Her full pipeline in one screen" list
-- [ ] **Step 2: `SKILL.md`.** Frontmatter `name: video-mindmap`. The
-  description triggers on:
-  - a "Ready for breakdown" Drive folder link or a YouTube URL, with a
-    request for a breakdown, workflow or mind map
-  - "expand <code>" or a screenshot of a map node
-
-  Body sections:
-  1. **Paths:**
-     - `WORK="$HOME/Documents/Video Mindmaps/<video-id>"`
-     - `SKILL="$HOME/.skillbook/skills/video-mindmap"`
-  2. **Pull:**
-     - Take `info.json` and `transcript.vtt` from the Drive folder with the
-       Google Drive connector.
-     - Get the video locally:
-       `uvx --from "yt-dlp[default]" yt-dlp --js-runtimes node -f "bv*[height<=720]+ba/b[height<=720]" --merge-output-format mp4 -o "$WORK/video.mp4" URL`.
-       The Drive video is too large for the connector.
-     - With no Drive folder, add `--write-info-json` (to `$WORK/info`) and
-       `--write-subs --write-auto-subs --sub-langs "en.*,en" --sub-format vtt`.
-  3. **Transcript:**
-     - `python3 "$SKILL/scripts/transcript_md.py" …`
-     - With no subtitles, run `uv run "$SKILL/scripts/transcribe.py" "$WORK/video.mp4" "$WORK/transcript.vtt"` first.
-  4. **Breakdown:**
-     - Read all of `transcript.md`, then write `workflow.md` and `map.json`
-       per the reference.
-     - Copyright rule: paraphrase; one quote per node at most, under 15
-       words; no transcript dumps.
-     - Validate with `mapfile.py validate`.
-  5. **Frames:**
-     - Run `uv run "$SKILL/scripts/frames_at.py" "$WORK/video.mp4" "$WORK/map.json" "$WORK/candidates"`.
-     - Read each sheet and pick at most 2 frames per node that show the step
-       (screen, UI, result), not just the speaker.
-     - Write the picks into `frames`.
-  6. **Whimsical:**
-     - Call `how_to` first to learn the mind map input format.
-     - Run `to_outline.py`, then `create` a mind map titled
-       "<video title> — workflow map".
-     - Store the id and URL with `mapfile.py set`.
-     - If the connector isn't available, say so and continue.
-  7. **Atlas:**
-     - Load `artifact-design`, then `render_atlas.py`.
-     - Publish `$WORK/atlas/index.html` with a `files` map of every
-       `frames/<name>`, icon `map`.
-     - Store the URL with `mapfile.py set`.
-  8. **Report:** the doc path, the Whimsical link, the atlas link, node and
-     frame counts, and anything skipped.
-  9. **Expand loop:**
-     - Read the code from the screenshot.
-     - `fetch` the Whimsical map, write its outline to
-       `$WORK/whimsical.md`, and run `mapfile.py reconcile`. Tell the user
-       what changed.
-     - Choose the source:
-       - **From the video:** re-read `transcript.md` from 90 s before the
-         node's times to 90 s after.
-       - **Research:** WebSearch, and every child gets `refs`.
-       - Default: video first, then research only if the video has nothing
-         more.
-     - `mapfile.py add` for each child, then `validate`.
-     - Whimsical `edit`: add the children under that node, and add codes to
-       any user nodes that reconcile numbered.
-     - `frames_at.py --codes <new codes>`, then pick frames.
-     - Run `render_atlas.py` and republish to the stored atlas URL.
-     - Report the new codes.
-  10. **Budget notes:**
-      - A sheet is roughly 1.4k image tokens.
-      - Read sheets one branch at a time.
-- [ ] **Step 3:** Push the skill into the skillbook library:
-  - `SKILLBOOK_LOCK_LIBRARY="$HOME/.skillbook-library" skillbook add video-mindmap --project "$HOME"`
-    (or `push` if `add` isn't the right verb; check `skillbook --help`)
-  - commit in `~/.skillbook-library` with
-    `feat: video-mindmap skill (breakdown, Whimsical map, frame atlas, expand)`
-  - confirm `~/.claude/skills/video-mindmap` resolves to the edited folder
-
-### Task 12: End-to-end on `reFzEtCG_m8`
-
-- [ ] **Step 1:** Follow SKILL.md for the Drive folder from Task 9, Step 8.
-  Record wall-clock time and image tokens per step.
-- [ ] **Step 2:** Check the results:
-  - `workflow.md` covers all 18 chapters
-  - `mapfile.py validate` passes
-  - every video node has a timestamp, and each is spot-checked against the
-    video for 5 random nodes
-- [ ] **Step 3:** Once the Whimsical connector is available, create the map,
-  then `fetch` it back. Answer the spec's open questions:
-  - are links clickable?
-  - can a board hold images?
-  - is there a size limit?
-
-  Write the answers into the feature doc.
-- [ ] **Step 4:** Publish the atlas. Open it and check the deep link `#3.2`,
-  the lightbox and the mobile width.
-- [ ] **Step 5:** Expand test:
-  - hand-add a node in Whimsical (the user does this, or it's done through
-    `edit`)
-  - run "expand" on one node from the video and one with research
-  - confirm the hand-added node survives and gets a code
-- [ ] **Step 6:** Update the feature doc Follow-ups and the CHANGELOG. Commit
-  `docs: video-mindmap end-to-end results`.
+### Tasks 10–13: the FigJam toolkit (revised 2026-09-28)
+
+> Tasks 10–12 originally described a Whimsical skill with an HTML atlas. After
+> live canvas tests the user chose FigJam, and asked for a deterministic
+> pipeline with Sonnet only at judgment steps and minimum-to-medium tokens
+> (spec, "Architecture"). The toolkit is real code with tests, so it is its
+> own project: `~/Developer/ai-media/video-mindmap` (own git repo, README,
+> CHANGELOG), plus a thin skillbook skill that points to it.
+
+**Layout of `video-mindmap/`**
+
+| File | Responsibility |
+|---|---|
+| `vmm/transcript.py` | `parse_vtt`, `paragraphs`, `render_markdown`: dedupe rolling auto-captions, timestamped paragraphs under chapter headings |
+| `vmm/mapfile.py` | `load`, `save`, `validate`, `next_code`, `add_child`, `code_key`, `parent_of` for the map.json in the spec |
+| `vmm/frames.py` | `candidate_times`, `sharpness` (variance of a Laplacian over the grey image), `pick_frames(video, map, out)` |
+| `vmm/layout.py` | `layout(map) -> {code: Box}`: root on the left, each depth one column to the right, a node's children stacked vertically and centred on it. Every video node owns a row of node + frame + note |
+| `vmm/render.py` | `draw_scripts(map, layout, uploads) -> [js]`: one fixed renderer function plus a compact data array, split into chunks of at most 40 nodes |
+| `vmm/figjam.py` | `post_uploads(urls, files) -> {file: node_id}` (multipart POST, the `upload_assets` contract) and `record(map, returned_ids)` |
+| `vmm/cli.py` | `vmm prepare / validate / frames / layout / render / upload / record / context / add` |
+| `prompts/structure.md`, `prompts/expand.md` | The only model instructions, each ending in the exact JSON shape to return |
+| `transcribe.py` | faster-whisper fallback (PEP 723, `uv run`) |
+| `tests/` | stdlib unittest; ffmpeg-dependent tests skip without ffmpeg |
+
+Dependencies: Python 3.12, `pillow`, `numpy` (frames only), ffmpeg on
+`PATH`. `vmm prepare` uses `uvx --from "yt-dlp[default]" yt-dlp --js-runtimes node`
+when there is no Drive folder.
+
+#### Task 10: Deterministic core (TDD, one commit per module)
+
+Each module gets its tests first. Run with `.venv/bin/python -m unittest discover -s tests`.
+
+- **transcript:** made-up rolling auto-captions give each line once, with
+  its first timestamp. `&amp;` and inline `<c>` tags are cleaned. Paragraphs
+  break at 20 s and at chapter starts. Both the service's `info.json`
+  (`start`) and raw yt-dlp info (`start_time`) work. No chapters gives one
+  "Full video" section.
+- **mapfile:** a clean sample validates. Each of these is caught:
+  - a duplicate code
+  - a missing parent
+  - a parent that doesn't match the code
+  - a quote over 15 words
+  - a note over 25 words
+  - a video node without a time
+  - a research node without refs
+  - a time beyond the video's duration
+
+  Also: `next_code` gives `3` under root and `1.2` after `1.1`, and
+  `add_child` never renumbers existing nodes.
+- **frames:** `candidate_times(t)` is `[t, t+2, t+4]`, clamped to the
+  duration. On a synthetic clip, `sharpness` ranks a frame above a
+  gaussian-blurred copy of itself. `pick_frames` writes exactly one
+  `frames/<code>.jpg` per video node with a time, 960 px wide, and sets
+  `node["frame"]`.
+- **layout:** for sample trees of 1, 5 and 60 nodes:
+  - no two boxes overlap (node, frame and note boxes all count)
+  - every child's x is greater than its parent's
+  - siblings keep code order top to bottom
+  - the parent is centred on its children's span
+  - the same input gives the same output
+- **render:** the generated JS
+  - contains the data as JSON that parses back to the input rows
+  - is under 50,000 characters per chunk
+  - puts each node's code and title in its label
+  - puts a `https://www.youtube.com/watch?v=<id>&t=<s>s` link on the time
+    line
+  - references every uploaded frame's node id exactly once
+  - makes connectors root→node, node→frame and frame→note
+
+  The renderer is plain Plugin API calls (`createShapeWithText`,
+  `createSticky`, `createConnector`, `setRangeHyperlink`), and it returns
+  `{code: {node, note, connectors}}` ids.
+- **figjam:** `post_uploads` is tested against a local stub HTTP server. It
+  does a multipart POST with the file name as the layer name and parses
+  `placedOnNodeId`. `record` merges the returned ids into `figjam_ids`, and
+  a second draw skips nodes that already have ids.
+
+#### Task 11: CLI, prompts, skill
+
+- `vmm` subcommands wire the modules and print one short line each. `vmm
+  prepare <drive-folder-files | youtube-url>` writes `WORK/info.json`,
+  `transcript.vtt`, `transcript.md` and `video.mp4`.
+- `prompts/structure.md` tells the model:
+  - **Input:** `transcript.md` and the video info.
+  - **Output:** only a JSON array of nodes `{code, parent, title, note,
+    times, quote}`.
+  - **Rules:** level 1 = the real phases of her workflow (merge or split
+    chapters), level 2 = steps, level 3 = techniques, tools, prompt patterns
+    and problems she solved; 40–90 nodes for 30 minutes; every node has the
+    time where it's shown; notes paraphrase in at most 25 words; at most one
+    quote per node, under 15 words; no invented facts.
+- `prompts/expand.md` is the same shape for the children of one node. It
+  takes the `vmm context` window, and `source: "research"` with `refs` when
+  the user asks for research.
+- `~/.skillbook/skills/video-mindmap/SKILL.md` lists the steps and marks the
+  two Sonnet steps. Those run as `Agent(model="sonnet")` with the prompt file
+  as the whole brief. Then add it with skillbook and commit in the library.
+
+#### Task 12: End-to-end on `reFzEtCG_m8`
+
+Run on the new FigJam board in "My Workspace":
+
+1. prepare
+2. Sonnet structure
+3. validate
+4. frames
+5. layout
+6. `upload_assets` + `vmm upload`
+7. render
+8. Sonnet draw
+9. record
+
+Check:
+- every node has a code, a frame, a note and a working timestamp link
+- a screenshot of each top-level branch shows no overlaps
+- record the tokens each Sonnet step used and the wall-clock time per step
+
+#### Task 13: Expand, docs, ship
+
+- Expand one node from the video and one with research. Existing nodes must
+  move (same ids), not be recreated.
+- Toolkit docs:
+  - README: setup, every command, the pipeline diagram, the token budget
+  - CHANGELOG
+  - `docs/features/…` + INDEX
+- Add the project to `~/Developer/README.md`, to the project list in
+  `~/Developer/ai-media/CLAUDE.md`, and to `developer.code-workspace`.
