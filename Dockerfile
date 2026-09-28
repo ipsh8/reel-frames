@@ -1,5 +1,8 @@
 FROM python:3.12-slim
 
+# yt-dlp solves YouTube's JavaScript challenges with Deno; without it most formats are missing.
+COPY --from=denoland/deno:bin /deno /usr/local/bin/deno
+
 RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg \
     && rm -rf /var/lib/apt/lists/*
 
