@@ -17,8 +17,15 @@ All notable changes to this project. Format follows
   [a209707](https://github.com/ipsh8/reel-frames/commit/a209707),
   [6e5c54e](https://github.com/ipsh8/reel-frames/commit/6e5c54e),
   [7d54f35](https://github.com/ipsh8/reel-frames/commit/7d54f35),
-  [3898e57](https://github.com/ipsh8/reel-frames/commit/3898e57))
+  [3898e57](https://github.com/ipsh8/reel-frames/commit/3898e57),
+  [10c3cab](https://github.com/ipsh8/reel-frames/commit/10c3cab))
 - `ANALYZE_MAX_SECONDS` (default 180).
+
+### Fixed
+- A clear cut right after a busy shot (walking legs, crowds) was missed
+  because that shot's own motion raised the bar. A strong change across nearly
+  the whole frame now counts at a lower ratio.
+  ([7fd6b73](https://github.com/ipsh8/reel-frames/commit/7fd6b73))
 - Dependency: `opencv-python-headless`.
 
 ## [3.3.0] - 2026-09-19

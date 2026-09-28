@@ -1,7 +1,7 @@
 # Reel analysis evidence pack
 
 - **Status:** Shipped 2026-09-28, v3.4.0 (commits `fb3b6a4`, `a209707`,
-  `6e5c54e`, `7d54f35`, `3898e57`, and the `/analyze` endpoint commit)
+  `6e5c54e`, `7d54f35`, `3898e57`, `10c3cab`; busy-shot fix `7fd6b73`)
 - **Design:** `docs/specs/2026-09-28-reel-reverse-engineer-design.md`
 
 ## Problem
