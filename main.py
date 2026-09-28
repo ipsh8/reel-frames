@@ -69,6 +69,7 @@ def check_api_key(x_api_key: str = Header(None)):
 
 
 app.include_router(analyze_router, dependencies=[Depends(check_api_key)])
+app.include_router(youtube_service.router, dependencies=[Depends(check_api_key)])
 
 
 class FrameRequest(BaseModel):

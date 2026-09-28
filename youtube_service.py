@@ -199,3 +199,71 @@ def cached_video(url: str) -> str:
         with open(os.path.join(folder, "info.json"), "w") as f:
             json.dump(summarize_info(info), f, indent=2, ensure_ascii=False)
         return video
+def pick_subtitle_track(info: dict) -> Optional[tuple[str, bool]]:
+    """(language, is_auto) of the English track to fetch. People-written subtitles beat YouTube's."""
+    manual = info.get("subtitle_langs") or []
+    for lang in ("en", "en-US", "en-GB", *manual):
+        if lang in manual:
+            return lang, False
+    auto = info.get("auto_caption_langs") or []
+    for lang in ("en-orig", "en"):  # en-orig is the speech itself; plain en can be a machine translation
+        if lang in auto:
+            return lang, True
+    return None
+
+
+def cached_transcript(url: str) -> tuple[Optional[str], str, str]:
+    """(path of transcript.vtt or None, source, note). source: manual | auto | none | blocked."""
+    folder = os.path.dirname(cached_video(url))
+    with open(os.path.join(folder, "info.json")) as f:
+        track = pick_subtitle_track(json.load(f))
+    if track is None:
+        return None, "none", "YouTube has no English subtitles for this video."
+    lang, auto = track
+    source = "auto" if auto else "manual"
+    vtt = os.path.join(folder, "transcript.vtt")
+    with _lock_for(youtube_id(url)):
+        if os.path.exists(vtt):
+            return vtt, source, ""
+        try:
+            _run_ydl(canonical_url(url), {
+                "skip_download": True, "writesubtitles": not auto, "writeautomaticsub": auto,
+                "subtitleslangs": [lang], "subtitlesformat": "vtt",
+                "outtmpl": os.path.join(folder, "subs.%(ext)s")}, "subtitles")
+        except HTTPException as e:
+            return None, "blocked", e.detail
+        got = os.path.join(folder, f"subs.{lang}.vtt")
+        if not os.path.exists(got):
+            return None, "blocked", "yt-dlp reported success but wrote no subtitle file."
+        os.replace(got, vtt)
+    return vtt, source, ""
+
+
+class TranscriptRequest(BaseModel):
+    video_url: str
+    output: Literal["zip", "json"] = "zip"
+
+
+@router.post("/transcript")
+def transcript(req: TranscriptRequest):
+    """info.json plus transcript.vtt when YouTube has English subtitles. Never fails for missing ones."""
+    vid = youtube_id(req.video_url)
+    if not vid:
+        raise HTTPException(422, "/transcript takes YouTube video links only")
+    vtt, source, note = cached_transcript(req.video_url)
+    files = [("info.json", os.path.join(video_dir(vid), "info.json"))]
+    if vtt:
+        files.append(("transcript.vtt", vtt))
+    headers = {"X-Transcript": source}
+    if req.output == "json":
+        return JSONResponse({"transcript": source, "note": note, "files": [
+            {"filename": name, "content_base64": base64.b64encode(open(path, "rb").read()).decode()}
+            for name, path in files]}, headers=headers)
+    final = os.path.join(tempfile.gettempdir(), f"transcript_{uuid.uuid4().hex}.zip")
+    with zipfile.ZipFile(final, "w", zipfile.ZIP_DEFLATED) as z:
+        for name, path in files:
+            z.write(path, name)
+        if note:
+            z.writestr("note.txt", note + "\n")
+    return FileResponse(final, media_type="application/zip", filename="transcript.zip", headers=headers,
+                        background=BackgroundTask(lambda: os.remove(final)))
