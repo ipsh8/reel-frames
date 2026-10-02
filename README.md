@@ -205,6 +205,7 @@ See `.env.example`.
 | Var | Default | |
 |---|---|---|
 | `API_KEY` | — | **required**; clients send it as `X-API-Key` |
+| `PORT` | — | **Railway only; set it to `8000`.** The app always listens on 8000 (Dockerfile), but Railway's `/health` healthcheck (`railway.json`) probes `PORT`. Without it every deploy failed the healthcheck and Railway kept the old version |
 | `IG_COOKIES` | — | optional; the `Cookie` header from a logged-in instagram.com request, pasted as one line (`sessionid=…; csrftoken=…`). Logs the server in, so Instagram stops withholding audio. Use a throwaway account |
 | `IG_COOKIES_FILE` | — | optional path to a Netscape `cookies.txt`; used instead of `IG_COOKIES` when both are set |
 | `YTDLP_PROXY` | — | optional; `http://user:pass@host:port`. `/audio` and `/download` reach Instagram through it, so reels Instagram mutes for this server come back with sound, and every YouTube request goes through it. Use a **residential** proxy; `/frames` never uses it for Instagram |

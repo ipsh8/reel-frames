@@ -3,6 +3,13 @@
 All notable changes to this project. Format follows
 [Keep a Changelog](https://keepachangelog.com); dates are ISO 8601.
 
+## Unreleased - 2026-10-02
+
+### Fixed
+- 3.5.0 is live. Deploys had failed Railway's healthcheck because `PORT`
+  was not set; `PORT=8000` is now a Railway variable and is documented in
+  the README.
+
 ## [3.5.0] - 2026-09-28
 
 ### Added
